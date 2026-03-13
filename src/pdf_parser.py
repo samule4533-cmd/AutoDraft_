@@ -13,10 +13,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-import cleaning
-import field_extract
 from chunker import split_markdown_into_chunks
-from image_parser import build_image_caption_chunks
 from output_writer import build_document_json, save_outputs
 
 # =============================================================================
@@ -30,11 +27,24 @@ load_dotenv()
 # Paths
 # =============================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-INPUT_DIR = PROJECT_ROOT / "data" / "raw" / "sample_notices"
-OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "parsing_result_notices"
 
-DEFAULT_PDF_NAME = os.getenv("DEFAULT_PDF_NAME", "sample1.pdf")
-SOURCE_PDF = INPUT_DIR / DEFAULT_PDF_NAME
+DOC_SOURCE_TYPE = os.getenv("DOC_SOURCE_TYPE", "company").strip().lower()
+DEFAULT_PDF_SUBDIR = os.getenv("DEFAULT_PDF_SUBDIR", "").strip()
+DEFAULT_PDF_NAME = os.getenv("DEFAULT_PDF_NAME", "sample_company.pdf").strip()
+
+if DOC_SOURCE_TYPE == "company":
+    INPUT_DIR = PROJECT_ROOT / "data" / "raw" / "company"
+    OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "parsing_result_company"
+elif DOC_SOURCE_TYPE == "notice":
+    INPUT_DIR = PROJECT_ROOT / "data" / "raw" / "sample_notices"
+    OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "parsing_result_notices"
+else:
+    raise ValueError(f"DOC_SOURCE_TYPE 값이 올바르지 않습니다: {DOC_SOURCE_TYPE}")
+
+if DEFAULT_PDF_SUBDIR:
+    SOURCE_PDF = INPUT_DIR / DEFAULT_PDF_SUBDIR / DEFAULT_PDF_NAME
+else:
+    SOURCE_PDF = INPUT_DIR / DEFAULT_PDF_NAME
 
 # =============================================================================
 # Config
@@ -50,20 +60,28 @@ SAVE_VECTOR_CHUNKS = True
 
 PDF_PARSE_PROMPT = """
 너는 RAG 파이프라인을 위한 최고 수준의 문서 파서야.
-첨부된 PDF 문서를 읽고 레이아웃이 완벽하게 보존된 Markdown 형식으로 변환해줘.
+첨부된 PDF 문서를 읽고 레이아웃이 최대한 보존된 Markdown 형식으로 변환해줘.
 
-[🔥 절대 준수 사항 - 위반 시 시스템 오류 발생]
-1. 누락 금지: 문서 내의 텍스트와 '표(Table)'는 단 하나도 누락하거나 요약하지 말고 100% 모두 추출할 것.
-2. 생략 금지: 표가 길거나 복잡하더라도 절대 임의로 생략(Skip)하거나 중단하지 말 것. 원본에 있는 모든 데이터를 있는 그대로 전부 출력해.
-3. 문서의 제목, 목차, 본문 구조를 마크다운 헤더(#, ##, ###)로 정확히 계층화할 것.
-4. 표는 마크다운 표 문법(|---|---|)을 사용하여 행과 열 구조를 원본과 동일하게 유지할 것.
+[절대 준수 사항]
+1. 문서 내 텍스트, 표, 제목, 소제목, 항목, 번호, 캡션은 임의로 누락하거나 요약하지 말 것.
+2. 문서의 구조를 가능한 한 유지하면서 Markdown 헤더(#, ##, ###)로 계층화할 것.
+3. 표는 가능한 경우 Markdown 표 문법으로 보존하고, 표 구조가 복잡하면 행/열 의미가 유지되도록 텍스트로라도 충실히 옮길 것.
+4. 숫자, 날짜, 등록번호, 특허번호, 인증번호, 기관명, 회사명, 제품명, 기술명, 문의처 등은 원문에 가깝게 보존할 것.
+5. 본문 내 강조(**bold**), 목록, 표제어, 도면명, 도표 설명, 붙임 제목 등은 가능한 한 유지할 것.
+6. 읽기 애매한 부분은 임의로 자연스럽게 바꾸지 말고 원문에 가깝게 남길 것.
 
-[공고문/입찰문서 특화 지침]
-5. 공고번호, 공고명, 기관명, 공사명/사업명, 일정(제출 개시/마감/개찰), 금액, 장소, 문의처는 특히 정확히 보존할 것.
-6. 숫자, 날짜, 전화번호, 금액, 퍼센트, 고유명사는 임의로 바꾸거나 정리하지 말고 원문에 가깝게 유지할 것.
-7. 본문과 붙임 문서(예: 청렴서약서, 확인서, 동의서, 서식)는 구분하여 각각 제목을 유지할 것.
-8. 체크박스, 서명란, 날인란, 붙임 제목도 가능한 한 텍스트로 보존할 것.
-9. 읽기 애매한 부분은 내용을 추정해 매끄럽게 바꾸기보다, 원문에 가깝게 보존할 것.
+[회사 자료 특화 지침]
+7. 문서가 특허, 인증서, 회사소개서, 실적자료, 제안서, 기술소개서, 브로슈어 중 무엇에 가까운지 구조를 유지하며 파싱할 것.
+8. 특허 문서의 경우 발명의 명칭, 기술분야, 배경기술, 해결과제, 해결수단, 효과, 청구항, 도면 설명을 특히 정확히 보존할 것.
+9. 인증 문서의 경우 인증명, 인증기관, 인증번호, 등록일, 유효기간, 대상, 범위를 정확히 보존할 것.
+10. 회사소개/실적 자료의 경우 사업 개요, 주요 기술, 제품/서비스 설명, 프로젝트명, 발주처, 기간, 성과, 수치 정보, 표와 목록을 정확히 보존할 것.
+11. 목차가 있으면 목차 구조를 유지하고, 본문 섹션 제목이 분명하면 Markdown 헤더로 승격할 것.
+12. 문서 검색과 질의응답에 도움이 되도록, 의미 있는 제목/소제목/섹션 구분이 사라지지 않게 할 것.
+13. 특허 문서의 경우 페이지 상단 또는 하단에 기재된 등록특허번호, 공개번호, 출원번호, 문서 식별번호와 같은 식별 정보를 누락하지 말 것.
+14. 특히 첫 페이지 및 각 페이지 상단 우측/좌측의 작은 텍스트라도 특허번호, 등록번호, 문서번호에 해당하면 반드시 본문에 보존할 것.
+15. 페이지 머리글처럼 보이더라도 특허 식별번호는 문서 검색과 식별에 중요하므로 생략하지 말 것.
+16. "중략", "생략", "요약", "...", "등" 등의 축약 표현을 임의로 삽입하지 말 것.
+17. 응답은 문서에서 확인되는 내용을 처음부터 끝까지 순서대로 충실히 옮길 것.
 
 출력은 설명 없이 Markdown 본문만 반환할 것.
 """.strip()
@@ -86,7 +104,15 @@ def korean_ratio(s: str) -> float:
 
 
 def build_output_dir(source_pdf: Path) -> Path:
-    out_dir = OUTPUT_ROOT / source_pdf.stem
+    """
+    입력 루트 아래 상대경로를 유지하면서 output dir 생성
+    예:
+    data/raw/company/certification_list_1/sample_company.pdf
+    ->
+    data/processed/parsing_result_company/certification_list_1/sample_company/
+    """
+    relative_parent = source_pdf.relative_to(INPUT_DIR).parent
+    out_dir = OUTPUT_ROOT / relative_parent / source_pdf.stem
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -126,13 +152,11 @@ def normalize_markdown_headings(markdown_text: str) -> str:
     for line in lines:
         s = line.strip()
 
-        # 이미 markdown 헤더면 그대로 유지
         if re.match(r"^\s{0,3}#{1,6}\s+", s):
             normalized.append(line)
             continue
 
-        # 줄 전체가 **제목** 형태인 경우만 헤더로 승격
-        m = re.match(r"^\*\*([^*]{2,80})\*\*$", s)
+        m = re.match(r"^\*\*([^*]{2,120})\*\*$", s)
         if m:
             normalized.append(f"## {m.group(1).strip()}")
             continue
@@ -140,47 +164,6 @@ def normalize_markdown_headings(markdown_text: str) -> str:
         normalized.append(line)
 
     return "\n".join(normalized)
-
-
-def build_final_pages_like(markdown_text: str) -> List[Dict[str, Any]]:
-    """
-    기존 field_extract.py를 최대한 건드리지 않기 위해
-    final_pages 비슷한 구조를 한 페이지짜리로 만들어 재사용한다.
-    """
-    page_payload = {
-        "page_number": 1,
-        "engine_used": "gemini_file_api",
-        "quality": {
-            "text_len": len(markdown_text or ""),
-            "korean_ratio": round(korean_ratio(markdown_text or ""), 4),
-            "garbled": False,
-        },
-        "md_reason": "gemini_file_api_markdown",
-        "final_text": markdown_text or "",
-        "cleaned_text": "",
-        "cleaned_for_fields": "",
-        "cleaned_render_ocr_text": "",
-        "cleaned_gemini_key_values": {},
-        "docling_dict": {},
-        "render_ocr_text": None,
-        "gemini_page_vision": None,
-        "gemini_key_values": {},
-        "tables_normalized": [],
-        "blocks": [],
-        "images": [],
-        "image_ocr": [],
-        "needs_review": False,
-        "needs_review_reasons": [],
-        "warnings": [],
-        "errors": [],
-    }
-
-    try:
-        page_payload = cleaning.clean_page_payload(page_payload)
-    except Exception as e:
-        logger.warning("clean_page_payload 실패: %s", e)
-
-    return [page_payload]
 
 
 # =============================================================================
@@ -254,21 +237,13 @@ async def async_main():
 
     markdown_text = await parse_pdf_to_markdown(source_pdf)
 
-    # Markdown 정규화:
-    # **입찰공고** 같은 줄 전체 볼드 제목을 ## 입찰공고 형태로 변환
+    # 줄 전체 볼드 제목을 markdown heading으로 보정
     markdown_text = normalize_markdown_headings(markdown_text)
 
     elapsed_parse = time.perf_counter() - t0
 
-    final_pages = build_final_pages_like(markdown_text)
-
-    try:
-        fields = {
-            "bid_amount": field_extract.extract_bid_amount_from_final_pages(final_pages),
-        }
-    except Exception as e:
-        logger.warning("fields 추출 실패: %s", e)
-        fields = {}
+    # 회사 자료 단계에서는 field 추출 비활성화
+    fields: Dict[str, Any] = {}
 
     text_chunks = split_markdown_into_chunks(
         markdown_text=markdown_text,
@@ -277,12 +252,7 @@ async def async_main():
         model_name=GEMINI_PDF_MODEL,
     )
 
-    image_chunks = await build_image_caption_chunks(
-        source_pdf=source_pdf,
-        output_dir=output_dir,
-    )
-
-    chunks = text_chunks + image_chunks
+    chunks = text_chunks
     elapsed_total = time.perf_counter() - t0
 
     document_json = build_document_json(
@@ -291,20 +261,23 @@ async def async_main():
         chunks=chunks,
         elapsed_sec=elapsed_total,
         fields=fields,
-        image_count=len(image_chunks),
+        image_count=0,
         model_name=GEMINI_PDF_MODEL,
     )
 
     parse_report = {
         "source_file": str(source_pdf),
         "document_id": source_pdf.stem,
+        "doc_source_type": DOC_SOURCE_TYPE,
+        "input_dir": str(INPUT_DIR),
+        "output_root": str(OUTPUT_ROOT),
         "mode": "fast_gemini_file_api",
         "model": GEMINI_PDF_MODEL,
         "elapsed_parse_sec": round(elapsed_parse, 3),
         "elapsed_total_sec": round(elapsed_total, 3),
         "text_len": len(markdown_text or ""),
         "text_chunk_count": len(text_chunks),
-        "image_chunk_count": len(image_chunks),
+        "image_chunk_count": 0,
         "chunk_count": len(chunks),
         "field_keys": list(fields.keys()),
         "warnings": [],
@@ -326,7 +299,7 @@ async def async_main():
         save_vector_chunks=SAVE_VECTOR_CHUNKS,
     )
 
-    logger.info("🎉 완료! (Gemini File API + Markdown + JSON + Fields + Vector Chunks)")
+    logger.info("🎉 완료! (Gemini File API + Markdown + JSON + Vector Chunks)")
 
 
 def main():

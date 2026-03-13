@@ -236,6 +236,38 @@ def query_collection(
     return results
 
 
+def print_query_summary(query_text: str, results: Dict[str, Any]) -> None:
+    print(f"\n[질문] {query_text}")
+
+    ids = results.get("ids", [[]])
+    docs = results.get("documents", [[]])
+    metas = results.get("metadatas", [[]])
+    distances = results.get("distances", [[]])
+
+    if not ids or not ids[0]:
+        print("검색 결과 없음")
+        return
+
+    top_ids = ids[0]
+    top_docs = docs[0] if docs else []
+    top_metas = metas[0] if metas else []
+    top_distances = distances[0] if distances else []
+
+    for i, chunk_id in enumerate(top_ids):
+        header = ""
+        if i < len(top_metas) and top_metas[i]:
+            header = top_metas[i].get("header", "")
+
+        dist = top_distances[i] if i < len(top_distances) else None
+        preview = top_docs[i][:180].replace("\n", " ") if i < len(top_docs) else ""
+
+        print(f"\n  - rank {i+1}")
+        print(f"    id       : {chunk_id}")
+        print(f"    header   : {header}")
+        print(f"    distance : {dist}")
+        print(f"    preview  : {preview}...")
+
+
 # =============================================================================
 # Example CLI Entry
 # =============================================================================
@@ -248,34 +280,46 @@ def main():
     logger.info("현재 vector_chunks 경로: %s", notice_chunks_path)
     logger.info("현재 Chroma 저장 경로: %s", chroma_dir)
 
-    if notice_chunks_path.exists():
-        collection = load_and_upsert_chunks(
-            chunks_path=notice_chunks_path,
-            collection_name="ninewatt_bids_local",
-            persist_dir=str(chroma_dir),
-            batch_size=50,
-            embedding_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            default_doc_type="notice",
-            exclude_image_chunks=True,
-        )
+    if not notice_chunks_path.exists():
+        logger.warning("vector_chunks.json 파일이 없습니다: %s", notice_chunks_path)
+        return
 
-        print("\n[컬렉션 적재 확인]")
-        print("collection count:", collection.count())
-        print("sample get:", collection.get(limit=3))
+    collection = load_and_upsert_chunks(
+        chunks_path=notice_chunks_path,
+        collection_name="ninewatt_bids_local",
+        persist_dir=str(chroma_dir),
+        batch_size=50,
+        embedding_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default_doc_type="notice",
+        exclude_image_chunks=True,
+    )
 
+    print("\n[컬렉션 적재 확인]")
+    print("collection count:", collection.count())
+
+    sample = collection.get(limit=3)
+    print("sample ids:", sample.get("ids"))
+    print("sample metadatas:", sample.get("metadatas"))
+
+    test_queries = [
+        "입찰시 어떤 서류를 제출해야 하나?",
+        "입찰보증금은 어떻게 되나?",
+        "입찰참가자격이 무엇인가?",
+        "문의처 연락처는?",
+        "기초금액은 얼마인가?",
+    ]
+
+    print("\n[질문 테스트 시작]")
+    for q in test_queries:
         results = query_collection(
-            query_text="입찰참가자격이 무엇인가?", # 원하는 쿼리 던지기
+            query_text=q,
             collection_name="ninewatt_bids_local",
             persist_dir=str(chroma_dir),
             embedding_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             n_results=5,
             where={"doc_type": "notice"},
         )
-
-        print("\n[질문 결과]")
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-    else:
-        logger.warning("vector_chunks.json 파일이 없습니다: %s", notice_chunks_path)
+        print_query_summary(q, results)
 
 
 if __name__ == "__main__":

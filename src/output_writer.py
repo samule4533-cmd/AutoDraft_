@@ -1,4 +1,5 @@
 # 저장 포맷 책임 분리, 파일 저장 로직 재사용, DB저장 변환 용이
+# 현재 코드는 로컬임베딩 추후에 openai api 가지고와서 임베딩 해야함!
 
 import json
 import re
