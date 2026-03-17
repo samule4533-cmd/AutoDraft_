@@ -130,10 +130,10 @@ async def parse_all() -> None:
     for pdf_path in all_pdfs:
         chunks_path = get_output_dir(pdf_path) / "vector_chunks.json"
 
-        # if chunks_path.exists():
-        #     skipped_files.append(pdf_path.name)
-        #     logger.info("[SKIP] %s (이미 파싱됨)", pdf_path.name)
-        #     continue
+        if chunks_path.exists():
+            skipped_files.append(pdf_path.name)
+            logger.info("[SKIP] %s (이미 파싱됨)", pdf_path.name)
+            continue
 
         logger.info("[PARSE] 시작: %s", pdf_path.name)
         try:

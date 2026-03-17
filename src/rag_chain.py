@@ -7,6 +7,7 @@
 
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -179,9 +180,14 @@ def build_context_block(
     total  = 0
 
     for i, chunk in enumerate(chunks):
+        # 헤더에서 Markdown 기호(#)를 제거한다.
+        # chunk['header']에는 "## 출원일자" 같이 # 기호가 그대로 담겨 있다.
+        # LLM이 이걸 그대로 인용하면 "[출처: ## 출원일자]"처럼 # 이 노출된다.
+        # LLM에 넘기는 context에서는 사람이 읽기 좋은 텍스트만 전달한다.
+        clean_header = re.sub(r"^#{1,6}\s*", "", chunk["header"]).strip()
         block = (
             f"[문서 {i + 1}]\n"
-            f"출처: {chunk['header']} | {chunk['source_file']}\n"
+            f"출처: {clean_header} | {chunk['source_file']}\n"
             f"{chunk['text']}\n"
         )
         if total + len(block) > max_chars:
@@ -253,12 +259,23 @@ def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
                 ),
             )
             answer = (getattr(resp, "text", "") or "").strip()
+            # Gemini가 빈 문자열을 반환하는 경우가 있다.
+            # (안전 필터 차단, 모델 오작동 등)
+            # 빈 채로 반환하면 챗봇 화면에 아무것도 안 보이므로 오류로 처리한다.
+            # ask()의 except 블록이 잡아서 _MSG_LLM_ERROR를 반환한다.
+            if not answer:
+                raise GeminiAPIError("LLM이 빈 응답을 반환했습니다.")
             logger.info("[%s] LLM 응답 수신: %d자", req_id, len(answer))
             return answer
         except Exception as e:
             last_exc = e
             err_str = str(e).lower()
-            is_rate_limit = "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str
+            is_rate_limit = (
+                "429" in str(e)
+                or "quota" in err_str
+                or "rate" in err_str
+                or "resource_exhausted" in err_str
+            )
             if is_rate_limit:
                 # RPD(일일 할당량) 초과는 재시도가 무의미하므로 즉시 중단
                 if "daily" in err_str or ("resource_exhausted" in err_str and "per_day" in err_str):
@@ -285,18 +302,29 @@ def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
 # =============================================================================
 def format_citations(chunks: list[dict]) -> list[Citation]:
     """
-    chunk_id 기준 중복 제거 후 Citation 리스트를 반환한다.
+    (header, source_file) 기준 중복 제거 후 Citation 리스트를 반환한다.
 
-    같은 헤더에서 복수의 청크가 통과했을 때 출처가 중복 표시되는 걸 방지.
+    chunk_id는 모든 청크가 고유하므로 chunk_id로는 중복이 절대 걸리지 않는다.
+    같은 섹션에서 복수의 청크가 threshold를 통과했을 때
+    사용자에게 같은 출처가 여러 번 표시되는 걸 막기 위해
+    (header, source_file) 조합을 dedup 키로 사용한다.
+
+    header에서 Markdown 기호(#)를 제거한다.
+    build_context_block에서도 동일하게 제거하므로
+    LLM 인라인 인용과 Citation 목록의 헤더 표기가 일치한다.
     """
     seen   = set()
     result = []
     for c in chunks:
-        if c["chunk_id"] not in seen:
-            seen.add(c["chunk_id"])
+        # 같은 섹션(헤더+파일)이면 청크가 여러 개여도 출처는 하나로 묶는다
+        key = (c["header"], c["source_file"])
+        if key not in seen:
+            seen.add(key)
             result.append(Citation(
                 chunk_id=    c["chunk_id"],
-                header=      c["header"],
+                # # 기호 제거: "## 출원일자" → "출원일자"
+                # LLM에 전달한 context와 표기 방식을 통일한다
+                header=      re.sub(r"^#{1,6}\s*", "", c["header"]).strip(),
                 source_file= c["source_file"],
                 distance=    c["distance"],
             ))

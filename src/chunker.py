@@ -150,7 +150,26 @@ def split_markdown_into_chunks(
         nonlocal current_lines, current_header
         body = "\n".join(current_lines).strip()
         if body:
-            sections.append({"header": current_header, "text": body})
+            # 헤더 라인(# 으로 시작)을 제외한 실제 내용이 있는지 확인한다.
+            #
+            # 문제 상황:
+            #   PDF에서 변환된 Markdown에 헤더만 있고 내용이 없는 섹션이 존재한다.
+            #   예: "## 출원일자" 다음에 바로 다른 헤더가 오는 경우.
+            #
+            # 기존 코드에서 발생하는 문제:
+            #   current_lines에 헤더 라인 자체도 포함되어 있어서
+            #   body = "## 출원일자" 만으로도 if body 조건을 통과한다.
+            #   이 청크가 벡터 DB에 들어가면 "출원일자" 관련 질문에 매칭되지만
+            #   LLM에 전달되는 내용은 헤더 한 줄뿐이라 환각의 원인이 된다.
+            #
+            # [주의] 이 수정 후 최초 1회 벡터 DB 재적재가 필요하다.
+            #   기존에 이미 적재된 헤더 전용 청크는 이 필터로 걸러지지 않는다.
+            content_lines = [
+                l for l in body.splitlines()
+                if not re.match(r"^\s*#{1,6}\s+", l)
+            ]
+            if "\n".join(content_lines).strip():
+                sections.append({"header": current_header, "text": body})
         current_lines = []
 
     for line in lines:

@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
+이 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -168,6 +168,31 @@ def get_embedding_function(
 
 
 # =============================================================================
+# ChromaDB 클라이언트 캐시
+# =============================================================================
+# PersistentClient는 SQLite 파일을 열고 내부 인덱스를 로딩하는 비용이 있다.
+# 챗봇 환경에서는 쿼리마다 새 클라이언트를 만들면 응답 지연이 쌓인다.
+# persist_dir 경로를 키로 최초 1회만 초기화하고 이후엔 재사용한다.
+#
+# [스레드 안전성]
+# CPython의 GIL이 딕셔너리 읽기/쓰기를 원자적으로 보호한다.
+# ChromaDB PersistentClient 자체도 내부적으로 동시 접근을 처리한다.
+# Phase 1 단일 프로세스 환경에서는 추가 Lock 불필요.
+_chroma_client_cache: Dict[str, chromadb.PersistentClient] = {}
+
+
+def _get_or_init_client(persist_dir: str) -> chromadb.PersistentClient:
+    """
+    ChromaDB PersistentClient를 경로별로 캐싱해 반환한다.
+    같은 persist_dir에 대해 프로세스 수명 동안 단 하나의 클라이언트만 유지한다.
+    """
+    if persist_dir not in _chroma_client_cache:
+        logger.debug("ChromaDB 클라이언트 초기화: %s", persist_dir)
+        _chroma_client_cache[persist_dir] = chromadb.PersistentClient(path=persist_dir)
+    return _chroma_client_cache[persist_dir]
+
+
+# =============================================================================
 # Collection Management
 # =============================================================================
 def get_or_create_collection(
@@ -181,7 +206,7 @@ def get_or_create_collection(
     embedding_provider가 달라지면 반드시 다른 collection_name 사용 또는
     reset_collection()으로 기존 컬렉션을 먼저 삭제해야 함 (차원 불일치 방지).
     """
-    client = chromadb.PersistentClient(path=persist_dir)
+    client = _get_or_init_client(persist_dir)
     ef = get_embedding_function(provider=embedding_provider, model=embedding_model)
 
     # hnsw:space="cosine" → 벡터 간 거리 계산 방식을 코사인 거리로 지정.
@@ -207,7 +232,10 @@ def reset_collection(
     임베딩 모델(provider)을 교체할 때 반드시 호출해야 함.
     기존 벡터와 새 벡터는 차원이 달라 같은 컬렉션에 공존 불가.
     """
-    client = chromadb.PersistentClient(path=persist_dir)
+    # 캐싱된 클라이언트를 재사용한다.
+    # reset_collection에서 별도 클라이언트를 만들면
+    # 같은 persist_dir에 대해 2개의 인스턴스가 생겨 파일 lock 충돌 위험이 있다.
+    client = _get_or_init_client(persist_dir)
 
     try:
         client.delete_collection(name=collection_name)
@@ -371,7 +399,8 @@ def main():
     logger.info("임베딩 provider: %s | 컬렉션: %s", embedding_provider, collection_name)
 
     try:
-        client = chromadb.PersistentClient(path=chroma_dir)
+        # CLI 확인 용도도 캐싱 클라이언트를 사용해 인스턴스를 통일한다
+        client = _get_or_init_client(chroma_dir)
         col = client.get_collection(collection_name)
         print(f"\n[컬렉션 현황] {collection_name}: {col.count()}개 청크")
     except Exception as e:
