@@ -107,13 +107,49 @@ data/raw/{company|sample_notices}/{subdir}/{file}.pdf
   - 검색된 본문 + 메타데이터를 조합해 Gemini에 전달
   - 답변 시 `chunk_id`, `header`, `source_file` 기반 출처 인용 강제
 
-### Phase 2: 대화형 UX 통합
-서버 연동 시점에 붙일 계획이다.
+## Phase 2: 대화형 UX 통합
 
-- Chat History 반영
-- Query Reformulation 추가
-- 연속 질문 대응  
-  예: `"그럼 거기는 얼마야?"` 같은 질문을 이전 맥락으로 해석
+Phase 2는 서버 연동 시점에 맞춰, 단발성 질의응답을 넘어 **대화형 문서 QA**로 확장하는 것을 목표로 한다.
+
+### 목표
+- 이전 대화 맥락을 반영한 질의응답 지원
+- 연속 질문에 대한 문맥 해석 강화
+- 서버 연동이 가능한 형태로 RAG 체인 구조 정리
+- API 입력/출력 구조 표준화
+
+### 구현 항목
+- `chat_history` 반영
+- **history 길이 제한 전략 결정 (구현 전 반드시 결정)**
+  - 대화가 쌓일수록 history가 그대로 프롬프트에 들어가면 컨텍스트 창 초과 및 응답 지연 발생
+  - 사내 문서 QA 특성상 **최근 3~5턴만 유지**가 적합 (대화가 짧고 주제 전환 잦음)
+  - 전략 선택지: 최근 N턴 슬라이싱 / 총 글자 수 기준 슬라이딩 / 오래된 history LLM 요약 압축
+- **Query Reformulation — 조건부 실행**
+  - 모든 질문에 reformulation LLM 호출 시 매 턴마다 Gemini 호출 2회 → 비용/지연 2배
+  - `"그럼"`, `"거기"`, `"그건"`, `"그것"`, `"해당"`, `"방금"` 등 지시어 감지 시에만 실행
+  - chat_history가 없으면 reformulation 생략 (독립 질문이므로)
+  - reformulation 실패 시 원본 query를 그대로 사용하는 fallback 필수
+- 연속 질문 대응
+  예: `"그럼 거기는 얼마야?"` 같은 질문을 이전 맥락 기반으로 재해석
+- `rag_chain.py`를 서버 연결 가능한 형태로 정리
+  - `RagResult` dataclass → Pydantic BaseModel 교체 (FastAPI JSON 직렬화 자동화)
+  - `reformulated_query: str | None` 필드 추가 (디버깅: 재작성 결과 추적용)
+- 입력/출력 구조 고정
+
+### 진행 순서
+1. history 길이 제한 전략 결정 (N턴 기준 권고)
+2. `chat_history` 반영 방식 정의 및 `rag_chain.py` 정리
+3. Query Reformulation 구현 (조건부 실행)
+4. FastAPI 기반 최소 API 레이어 구성
+5. `POST /chat` 엔드포인트 구현 및 테스트
+6. Postman 또는 Swagger를 통한 API 검증
+
+### 완료 기준
+- 이전 대화 맥락이 포함된 질문을 처리할 수 있다
+- `/chat` API를 통해 질문과 응답을 주고받을 수 있다
+- `chat_history`를 입력받아 답변 생성에 반영할 수 있다
+- 응답 구조가 JSON 형태로 고정된다
+- history가 길어져도 컨텍스트 창 초과가 발생하지 않는다
+- reformulation 여부와 재작성된 query가 응답에 포함되어 디버깅 가능하다
 
 ### Phase 3: 검색 품질 고도화
 E2E 테스트 후 도입 검토 예정.

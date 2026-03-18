@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-이 
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 

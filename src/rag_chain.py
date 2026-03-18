@@ -1,7 +1,7 @@
 # src/rag_chain.py
 #
-# Phase 1 — RAG 체인 코어
-# 역할: 질문 → 검색 → 필터 → 생성 → 출처 포함 답변 반환
+# Phase 1 → Phase 2 RAG 체인 코어
+# 역할: 질문 → (query reformulation) → 검색 → 필터 → 생성 → 출처 포함 답변 반환
 # 이 파일은 순수 오케스트레이션 레이어다.
 # ChromaDB / Gemini를 직접 건드리지 않고 vector_db / llm_api 함수만 호출한다.
 
@@ -10,10 +10,10 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 
 from google.genai import types
+from pydantic import BaseModel
 
 from llm_api import GeminiAPIError, get_client
 from vector_db import query_collection
@@ -33,6 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # max_context_chars: LLM에 넘길 컨텍스트 총 글자 수 상한.
 #   - 초과 시 하위 rank 청크부터 제외.
 #   - 한국어 1자 ≈ 2~3 토큰 기준 6000자 ≈ 2000~3000 토큰.
+# history_max_turns: chat_history 최대 보존 턴 수.
+#   - 1턴 = user + assistant 한 쌍. 5턴 = 메시지 10개.
+#   - 사내 문서 QA 특성상 먼 과거 맥락 가치가 낮아 5턴으로 제한.
 
 RAG_CONFIG = {
     "collection_name":    os.getenv("CHROMA_COLLECTION_NAME", "ninewatt_company"),
@@ -42,6 +45,7 @@ RAG_CONFIG = {
     "n_results":          10,
     "distance_threshold": 0.5,
     "max_context_chars":  6000,
+    "history_max_turns":  5,
 }
 
 # fallback 메시지를 상수로 분리해두면 나중에 한 곳만 수정하면 된다.
@@ -60,32 +64,126 @@ SYSTEM_PROMPT = """\
 5. 한국어로 답하라.
 """
 
+# reformulation 전용 프롬프트.
+# 답변 생성 프롬프트와 분리해두는 이유:
+#   역할이 다르기 때문이다. 이 프롬프트는 "질문을 고쳐라"이고
+#   SYSTEM_PROMPT는 "문서를 보고 답하라"다. 섞으면 둘 다 품질이 떨어진다.
+_REFORMULATION_PROMPT = """\
+아래는 사용자와 어시스턴트의 이전 대화다.
+마지막 [현재 질문]에 지시어(그럼, 거기, 그건, 해당 등)가 포함되어 있어 맥락 없이는 의미가 불분명하다.
+
+[이전 대화]
+{history}
+
+[현재 질문]
+{query}
+
+위 대화 맥락을 참고해 [현재 질문]을 맥락 없이도 이해할 수 있는 독립적인 질문으로 재작성하라.
+재작성된 질문만 출력하고 다른 설명은 하지 말라.
+"""
+
+# 지시어 패턴: 이 단어가 포함된 질문은 이전 맥락 없이는 의미가 불분명할 가능성이 높다.
+_REFERENTIAL_PATTERNS = re.compile(r"그럼|거기|그건|그것|해당|방금|그거|그 ")
+
 
 # =============================================================================
 # Return types
 # =============================================================================
-# dict 대신 dataclass를 쓰는 이유:
-#   - IDE 자동완성 + 오타를 컴파일 타임에 잡음
-#   - 반환 구조가 코드 자체로 문서화됨
-#   - 나중에 Pydantic BaseModel로 교체하면 JSON 직렬화까지 자동 (서버 연동 시)
+# Pydantic BaseModel을 사용하는 이유:
+#   - FastAPI response_model 선언 시 JSON 직렬화 자동화 + Swagger 자동 문서화
+#   - 중첩 모델(Citation)도 BaseModel이어야 Pydantic이 재귀 직렬화를 처리한다.
+#     dataclass를 중첩하면 FastAPI가 Citation 내부를 dict로 변환하지 못한다.
+#   - 필드 오타를 런타임이 아닌 객체 생성 시점에 잡는다.
 
-@dataclass
-class Citation:
+class Citation(BaseModel):
     chunk_id:    str
     header:      str
     source_file: str
     distance:    float | None
 
 
-@dataclass
-class RagResult:
-    answer:           str
-    citations:        list[Citation]
-    retrieved_count:  int          # ChromaDB가 반환한 청크 수
-    passed_threshold: int          # distance threshold 통과 수
-    top_distance:     float | None # 가장 유사한 청크의 distance (낮을수록 좋음)
-    fallback:         bool         # True = 정상 답변 아님
-    fallback_reason:  str | None   # "no_docs" | "retrieval_error" | "llm_error"
+class RagResult(BaseModel):
+    answer:             str
+    citations:          list[Citation]
+    used_query:         str        # 실제 검색에 사용된 query (reformulation 결과 또는 원본)
+    reformulated_query: str | None # 재작성이 발생한 경우만 값이 있고, 없으면 None
+    retrieved_count:    int        # ChromaDB가 반환한 청크 수
+    passed_threshold:   int        # distance threshold 통과 수
+    top_distance:       float | None  # 가장 유사한 청크의 distance (낮을수록 좋음)
+    fallback:           bool       # True = 정상 답변 아님
+    fallback_reason:    str | None # "no_docs" | "retrieval_error" | "llm_error"
+
+
+# =============================================================================
+# History helpers
+# =============================================================================
+def _trim_history(history: list, max_turns: int = RAG_CONFIG["history_max_turns"]) -> list:
+    """
+    chat_history를 최근 max_turns 턴만 유지한다.
+
+    1턴 = user 메시지 + assistant 메시지 한 쌍 = 메시지 2개.
+    max_turns * 2개를 초과하는 오래된 메시지는 제거한다.
+
+    role 구조 검증은 API 입력 스키마(Pydantic)에서 강제하므로
+    이 함수 안에서 중복 방어 로직을 두지 않는다.
+    """
+    return history[-(max_turns * 2):]
+
+
+# =============================================================================
+# Query Reformulation
+# =============================================================================
+def should_reformulate(query: str, chat_history: list | None) -> bool:
+    """
+    지시어가 포함되어 있고 이전 대화가 있을 때만 True를 반환한다.
+
+    두 조건을 모두 요구하는 이유:
+      - chat_history가 없으면 재작성에 쓸 맥락이 없어 LLM 호출이 무의미하다.
+      - 지시어가 없으면 독립 질문이므로 원본 그대로 검색해도 품질 차이가 없다.
+    두 조건 중 하나라도 불충족이면 LLM 호출을 생략해 비용/지연을 아낀다.
+    """
+    if not chat_history:
+        return False
+    return bool(_REFERENTIAL_PATTERNS.search(query))
+
+
+def reformulate_query(query: str, chat_history: list, req_id: str) -> str:
+    """
+    이전 대화 맥락을 참고해 질문을 독립적인 형태로 재작성한다.
+
+    실패(LLM 오류, 빈 응답, 너무 짧은 결과) 시 원본 query를 그대로 반환한다.
+    재작성은 검색 품질을 높이는 보조 수단이므로 이 단계의 실패가
+    전체 답변 흐름을 차단해서는 안 된다.
+    """
+    history_lines = []
+    for m in chat_history:
+        role = "사용자" if m.get("role") == "user" else "어시스턴트"
+        history_lines.append(f"{role}: {m.get('content', '')}")
+
+    prompt = _REFORMULATION_PROMPT.format(
+        history="\n".join(history_lines),
+        query=query,
+    )
+
+    try:
+        client = get_client()
+        resp = client.models.generate_content(
+            model=RAG_CONFIG["gemini_model"],
+            contents=[prompt],
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        result = (getattr(resp, "text", "") or "").strip()
+
+        if not result or len(result) < 5:
+            logger.warning("[%s] reformulation 결과 비정상 → 원본 query 사용: %r", req_id, result)
+            return query
+
+        logger.info("[%s] reformulation 완료: %r → %r", req_id, query, result)
+        return result
+
+    except Exception as e:
+        logger.warning("[%s] reformulation 실패 → 원본 query 사용: %s", req_id, e)
+        return query
 
 
 # =============================================================================
@@ -208,13 +306,15 @@ def build_context_block(
 def build_prompt(
     query: str,
     context: str,
-    chat_history: list | None = None,  # Phase 2에서 활성화
+    chat_history: list | None = None,
 ) -> str:
     """
     시스템 지시 + (이전 대화) + 참고 문서 + 질문을 하나의 프롬프트로 조합한다.
 
     chat_history 형식: [{"role": "user"|"assistant", "content": str}, ...]
-    Phase 1에서는 None으로 전달 → history_block 생략.
+    chat_history가 None이면 history_block 생략.
+    ask()에서 _trim_history()를 거친 history가 전달된다.
+    query는 reformulation이 발생했을 경우 재작성된 query(effective_query)가 전달된다.
     """
     history_block = ""
     if chat_history:
@@ -336,13 +436,22 @@ def format_citations(chunks: list[dict]) -> list[Citation]:
 # =============================================================================
 def ask(
     query: str,
-    chat_history: list | None = None,  # Phase 2
+    chat_history: list | None = None,
     filters: dict | None = None,       # Phase 3 (metadata pre-filtering)
 ) -> RagResult:
     """
     사용자 질문을 받아 RagResult를 반환한다.
 
-    반환값에 retrieved_count / passed_threshold / top_distance를 포함하는 이유:
+    chat_history 형식: [{"role": "user"|"assistant", "content": str}, ...]
+    filters: ChromaDB where 절 (예: {"doc_type": "company"})
+
+    RagResult.used_query / reformulated_query 의미:
+      - reformulation 발생: used_query = 재작성된 query, reformulated_query = 동일 값
+      - reformulation 없음: used_query = 원본 query,    reformulated_query = None
+      두 필드를 분리하는 이유: used_query는 "무엇으로 검색했나"(운영),
+      reformulated_query는 "재작성이 일어났나"(디버깅)로 역할이 다르다.
+
+    retrieved_count / passed_threshold / top_distance를 포함하는 이유:
       답변이 이상할 때 검색 문제인지(retrieved/passed 수치) 생성 문제인지를
       숫자만 보고 즉시 판별할 수 있게 하기 위해.
 
@@ -352,74 +461,98 @@ def ask(
     req_id = uuid.uuid4().hex[:8]
     logger.info("[%s] 질문 수신: %.80s", req_id, query)
 
-    # ── 1. 검색 ──────────────────────────────────────────────────────────────
+    # ── 0. history 정리 ───────────────────────────────────────────────────────
+    trimmed_history = _trim_history(chat_history) if chat_history else None
+
+    # ── 1. Query Reformulation (조건부) ───────────────────────────────────────
+    # should_reformulate()가 False면 LLM 호출 없이 원본 query를 그대로 사용한다.
+    # 재작성 실패 시 reformulate_query() 내부에서 원본 query로 자동 fallback한다.
+    # 재작성 결과가 원본과 동일하면 reformulation이 실질적으로 발생하지 않은 것으로 간주한다.
+    reformulated: str | None = None
+    if should_reformulate(query, trimmed_history):
+        result_q = reformulate_query(query, trimmed_history, req_id)
+        if result_q != query:
+            reformulated = result_q
+
+    effective_query = reformulated if reformulated else query
+
+    # ── 2. 검색 ──────────────────────────────────────────────────────────────
     try:
-        chunks = retrieve(query, req_id, filters=filters)
+        chunks = retrieve(effective_query, req_id, filters=filters)
     except Exception as e:
         logger.error("[%s] ChromaDB 검색 실패: %s", req_id, e)
         return RagResult(
-            answer=           _MSG_RETRIEVAL_ERROR,
-            citations=        [],
-            retrieved_count=  0,
-            passed_threshold= 0,
-            top_distance=     None,
-            fallback=         True,
-            fallback_reason=  "retrieval_error",
+            answer=             _MSG_RETRIEVAL_ERROR,
+            citations=          [],
+            used_query=         effective_query,
+            reformulated_query= reformulated,
+            retrieved_count=    0,
+            passed_threshold=   0,
+            top_distance=       None,
+            fallback=           True,
+            fallback_reason=    "retrieval_error",
         )
 
-    # ── 2. 필터 ──────────────────────────────────────────────────────────────
+    # ── 3. 필터 ──────────────────────────────────────────────────────────────
     passed = filter_by_threshold(chunks, req_id)
 
-    # ── 3. Fallback 분기 (관련 문서 없음) ────────────────────────────────────
+    # ── 4. Fallback 분기 (관련 문서 없음) ────────────────────────────────────
     if not passed:
         logger.info("[%s] 통과 청크 0개 → LLM 호출 생략, fallback 반환", req_id)
         return RagResult(
-            answer=           _MSG_NO_DOCS,
-            citations=        [],
-            retrieved_count=  len(chunks),
-            passed_threshold= 0,
-            top_distance=     chunks[0]["distance"] if chunks else None,
-            fallback=         True,
-            fallback_reason=  "no_docs",
+            answer=             _MSG_NO_DOCS,
+            citations=          [],
+            used_query=         effective_query,
+            reformulated_query= reformulated,
+            retrieved_count=    len(chunks),
+            passed_threshold=   0,
+            top_distance=       chunks[0]["distance"] if chunks else None,
+            fallback=           True,
+            fallback_reason=    "no_docs",
         )
 
-    # ── 4. 컨텍스트 조합 ──────────────────────────────────────────────────────
+    # ── 5. 컨텍스트 조합 ──────────────────────────────────────────────────────
     context = build_context_block(passed, req_id)
 
-    # ── 5. 프롬프트 조합 ──────────────────────────────────────────────────────
-    prompt = build_prompt(query, context, chat_history)
+    # ── 6. 프롬프트 조합 ──────────────────────────────────────────────────────
+    prompt = build_prompt(effective_query, context, trimmed_history)
 
-    # ── 6. LLM 호출 ───────────────────────────────────────────────────────────
+    # ── 7. LLM 호출 ───────────────────────────────────────────────────────────
     try:
         answer = generate_answer(prompt, req_id)
     except (GeminiAPIError, Exception) as e:
         logger.error("[%s] LLM 호출 실패: %s", req_id, e)
         return RagResult(
-            answer=           _MSG_LLM_ERROR,
-            citations=        [],
-            retrieved_count=  len(chunks),
-            passed_threshold= len(passed),
-            top_distance=     passed[0]["distance"],
-            fallback=         True,
-            fallback_reason=  "llm_error",
+            answer=             _MSG_LLM_ERROR,
+            citations=          [],
+            used_query=         effective_query,
+            reformulated_query= reformulated,
+            retrieved_count=    len(chunks),
+            passed_threshold=   len(passed),
+            top_distance=       passed[0]["distance"],
+            fallback=           True,
+            fallback_reason=    "llm_error",
         )
 
-    # ── 7. 결과 조합 ──────────────────────────────────────────────────────────
+    # ── 8. 결과 조합 ──────────────────────────────────────────────────────────
     result = RagResult(
-        answer=           answer,
-        citations=        format_citations(passed),
-        retrieved_count=  len(chunks),
-        passed_threshold= len(passed),
-        top_distance=     passed[0]["distance"],
-        fallback=         False,
-        fallback_reason=  None,
+        answer=             answer,
+        citations=          format_citations(passed),
+        used_query=         effective_query,
+        reformulated_query= reformulated,
+        retrieved_count=    len(chunks),
+        passed_threshold=   len(passed),
+        top_distance=       passed[0]["distance"],
+        fallback=           False,
+        fallback_reason=    None,
     )
     logger.info(
-        "[%s] 완료 | retrieved=%d passed=%d top_dist=%.4f",
+        "[%s] 완료 | retrieved=%d passed=%d top_dist=%.4f reformulated=%s",
         req_id,
         result.retrieved_count,
         result.passed_threshold,
         result.top_distance or 0.0,
+        reformulated is not None,
     )
     return result
 
@@ -431,10 +564,14 @@ def _print_result(result: RagResult) -> None:
     print("\n" + "=" * 60)
     if result.fallback:
         print(f"[FALLBACK: {result.fallback_reason}]")
+    if result.reformulated_query:
+        print(f"[Query Reformulation 발생]")
+        print(f"  재작성된 query: {result.reformulated_query}")
     print(f"\n[답변]\n{result.answer}")
     print(f"\n[검색 통계]")
-    print(f"  검색된 청크: {result.retrieved_count}개")
-    print(f"  threshold 통과: {result.passed_threshold}개")
+    print(f"  사용된 query:    {result.used_query}")
+    print(f"  검색된 청크:     {result.retrieved_count}개")
+    print(f"  threshold 통과:  {result.passed_threshold}개")
     print(f"  최근접 distance: {result.top_distance:.4f}" if result.top_distance is not None else "  최근접 distance: -")
     if result.citations:
         print("\n[출처]")
@@ -445,14 +582,14 @@ def _print_result(result: RagResult) -> None:
 
 _TEST_CASES = [
     # (케이스 설명, 질문)
-    ("문서에 있는 질문",       "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법은 무엇이야??"),
-    ("문서에 있는 질문",    "에너지 효율화 대상 건물을 선정하는 서버 및 이를 이용한 에너지 효율화 대상 건물 선정 방법은 무엇이야?"),
-    ("문서에 없는 질문",            "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법 특허에 인사평가 제도가 나와있어?"),
-    ("문서에 없는 질문",            "에너지 분석 플랫폼의 정보검색증강 기반 자연아 질의응답 서비스를 제공하는 방법 및 시스템 특허에 직원 복지 정책이 나와있어?"),
-    ("수치/날짜가 포함된 질문",       "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법 특허의 출원일은 언제야?"),
-    ("수치/날짜가 포함된 질문",       "인공지능 모델 기반 건물의 에너지 사용량 및 절약 방법 추론 솔루션 제공 방법 장치 및 시스템 특허의 등록번호를 알려줘"),
-    ("모호한 질문(키워드)",    "에너지 사용량"),
-    ("엉뚱한 질문",  "서울날씨 알려줘"),
+    ("문서에 있는 질문",         "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법은 무엇이야??"),
+    ("문서에 있는 질문",         "에너지 효율화 대상 건물을 선정하는 서버 및 이를 이용한 에너지 효율화 대상 건물 선정 방법은 무엇이야?"),
+    ("문서에 없는 질문",         "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법 특허에 인사평가 제도가 나와있어?"),
+    ("문서에 없는 질문",         "에너지 분석 플랫폼의 정보검색증강 기반 자연아 질의응답 서비스를 제공하는 방법 및 시스템 특허에 직원 복지 정책이 나와있어?"),
+    ("수치/날짜가 포함된 질문",   "건물 에너지 모델링 자동화 시스템 및 이를 이용한 방법 특허의 출원일은 언제야?"),
+    ("수치/날짜가 포함된 질문",   "인공지능 모델 기반 건물의 에너지 사용량 및 절약 방법 추론 솔루션 제공 방법 장치 및 시스템 특허의 등록번호를 알려줘"),
+    ("모호한 질문(키워드)",       "에너지 사용량"),
+    ("엉뚱한 질문",              "서울날씨 알려줘"),
 ]
 
 
