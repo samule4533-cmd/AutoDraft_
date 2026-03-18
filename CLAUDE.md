@@ -6,27 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 사내 챗봇을 위한 PDF 문서 파싱 → 청킹 → 벡터DB 적재 파이프라인. 한국어 기업 문서(특허, 인증서, 회사소개서 등) 처리에 특화된 RAG 인제스트 시스템.
 
-## Commands
-
-패키지 관리자는 `uv`를 사용한다.
-
-```bash
-# 의존성 설치
-uv sync
-
-# PDF 파싱 실행 (src/ 디렉토리에서 실행해야 상대 임포트가 동작함)
-cd src && uv run python pdf_parser.py
-
-# 벡터DB 적재 및 테스트 쿼리
-cd src && uv run python vector_db.py
-```
-
-실행 전 `.env` 파일에 다음 환경변수가 필요하다:
-- `GEMINI_API_KEY`: Gemini File API 키
-- `DOC_SOURCE_TYPE`: `company` 또는 `notice`
-- `DEFAULT_PDF_SUBDIR`: `data/raw/company/` 하위 서브디렉토리 (예: `certification_list_1`)
-- `DEFAULT_PDF_NAME`: 처리할 PDF 파일명 (예: `sample_company.pdf`)
-
 ## Architecture
 
 ### 데이터 흐름
