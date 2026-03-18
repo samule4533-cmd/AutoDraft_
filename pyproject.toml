@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "chromadb>=1.5.5",
-    "docling>=2.77.0",
-    "easyocr>=1.7.2",
+    "fastapi[standard]>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
     "google-genai>=1.66.0",
     "numpy>=2.4.3",
     "openai>=2.26.0",

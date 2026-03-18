@@ -43,7 +43,7 @@ RAG_CONFIG = {
     "embedding_provider": os.getenv("EMBEDDING_PROVIDER", "local"),
     "gemini_model":       os.getenv("GEMINI_RAG_MODEL", "gemini-2.0-flash"),
     "n_results":          10,
-    "distance_threshold": 0.5,
+    "distance_threshold": 0.55,
     "max_context_chars":  6000,
     "history_max_turns":  5,
 }
