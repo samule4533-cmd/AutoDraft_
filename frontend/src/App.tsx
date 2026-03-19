@@ -290,6 +290,15 @@ export default function App() {
           /* ── 빈 상태: 입력창 중앙 ── */
           <div className="chat-empty-state">
             <p className="empty-hint">사내 문서에 대해 질문해보세요.</p>
+            <div className="query-guide">
+              <p className="guide-title">💡 이런 질문을 해보세요</p>
+              <ul className="guide-list">
+                <li>등록된 파일이 궁금하면 &nbsp;<span className="guide-example">"파일 몇 개 있어?"</span></li>
+                <li>특정 주제 자료가 있는지 &nbsp;<span className="guide-example">"~ 관련 자료 있어?"</span></li>
+                <li>문서 내용이 궁금하면 &nbsp;<span className="guide-example">"~의 핵심 기술이 뭐야?"</span></li>
+                <li>이전 답변 이어서 &nbsp;<span className="guide-example">"그럼 거기서 ~은?"</span></li>
+              </ul>
+            </div>
             <div className="input-row">
               <textarea
                 ref={inputRef}
