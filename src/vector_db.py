@@ -1,5 +1,5 @@
-# 단독 pdf만 수행
 import json
+import time
 import logging
 import os
 from pathlib import Path
@@ -119,14 +119,26 @@ class _OpenAIEmbeddingFunction:
         # text-embedding-3-small 최대 8192 토큰 제한
         # 한국어 1글자 ≈ 2~3 토큰 기준으로 2500자를 안전 상한선으로 사용
         MAX_CHARS = 2500
+        MAX_RETRIES = 3
         safe_input = []
         for text in input:
             if len(text) > MAX_CHARS:
                 logger.warning("청크 길이 초과(%d자) → %d자로 truncate", len(text), MAX_CHARS)
                 text = text[:MAX_CHARS]
             safe_input.append(text)
-        response = self._client.embeddings.create(input=safe_input, model=self._model)
-        return [item.embedding for item in response.data]
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self._client.embeddings.create(input=safe_input, model=self._model)
+                return [item.embedding for item in response.data]
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 10 * (attempt + 1)  # 10s, 20s
+                    logger.warning("OpenAI 임베딩 실패, %d초 후 재시도 (%d/%d): %s", wait, attempt + 1, MAX_RETRIES, e)
+                    time.sleep(wait)
+                else:
+                    logger.error("OpenAI 임베딩 최종 실패: %s", e)
+                    raise
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         return self._embed(input)
@@ -296,28 +308,6 @@ def upsert_chunks_to_chroma(
 
     logger.info("ChromaDB 적재 완료! 현재 컬렉션 총 청크 수: %d", collection.count())
     return collection
-
-
-def load_and_upsert_chunks(
-    chunks_path: Path,
-    collection_name: str = "ninewatt_company",
-    persist_dir: str = "data/vector_store/chroma",
-    batch_size: int = 50,
-    embedding_provider: str = "local",
-    embedding_model: Optional[str] = None,
-    default_doc_type: Optional[str] = None,
-):
-    """JSON 파일에서 청크를 로드하여 ChromaDB에 upsert"""
-    chunks = load_chunks_from_json(chunks_path)
-    return upsert_chunks_to_chroma(
-        chunks=chunks,
-        collection_name=collection_name,
-        persist_dir=persist_dir,
-        batch_size=batch_size,
-        embedding_provider=embedding_provider,
-        embedding_model=embedding_model,
-        default_doc_type=default_doc_type,
-    )
 
 
 # =============================================================================
