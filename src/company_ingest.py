@@ -164,11 +164,11 @@ async def parse_all() -> None:
     # -------------------------------------------------------------------------
     # 4. 파싱된 파일이 있으면 ChromaDB 적재 자동 실행
     # -------------------------------------------------------------------------
-    if parsed_files or skipped_files:
+    if parsed_files:
         print("\nChromaDB 적재 시작...")
         upsert_all()
     else:
-        print("\n적재할 파일 없음 (파싱 성공 파일 0개).")
+        print("\n적재할 파일 없음 (신규 파싱 파일 0개).")
 
 
 def main():

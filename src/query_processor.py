@@ -268,7 +268,7 @@ def process_query(
     search_query = understood if understood else base_query
 
     # 4. routing
-    query_type = classify_query(query)
+    query_type = classify_query(search_query)
 
     return QueryContext(
         original_query=query,
