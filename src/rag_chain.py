@@ -31,7 +31,8 @@ RAG_CONFIG = {
     "embedding_provider": os.getenv("EMBEDDING_PROVIDER", "local"),
     "gemini_model":       os.getenv("GEMINI_RAG_MODEL", "gemini-2.0-flash"),
     "n_results":          10,
-    "distance_threshold": 0.55,
+    "distance_threshold":           0.55,
+    "existence_distance_threshold": 0.65,
     "max_context_chars":  6000,
 }
 
@@ -46,7 +47,12 @@ SYSTEM_PROMPT = """\
 [규칙]
 1. 반드시 아래 [참고 문서]에 있는 내용에만 근거하여 답하라.
 2. 문서에 없는 내용은 절대 추측하거나 지어내지 말고, "해당 내용이 문서에 없습니다"라고 답하라.
-3. 답변 내 사실마다 [출처: {헤더명}] 형태로 표기하라.
+3. 본문에는 출처를 쓰지 말고, 답변 마지막에 아래 형식으로 출처를 모아서 표기하라.
+
+📎 출처
+- {파일명} > {헤더명}
+- {파일명} > {헤더명}
+
 4. 표, 수치, 날짜는 원문 그대로 인용하라.
 5. 한국어로 답하라.
 6. 핵심만 간결하게 3~5문장 이내로 답하라. 불필요한 배경 설명이나 서론은 생략한다.
@@ -166,7 +172,7 @@ def handle_existence_query(ctx: QueryContext, req_id: str) -> RagResult:
         passed = [
             (metadatas[i], distances[i])
             for i in range(len(distances))
-            if distances[i] is not None and distances[i] <= RAG_CONFIG["distance_threshold"]
+            if distances[i] is not None and distances[i] <= RAG_CONFIG["existence_distance_threshold"]
         ]
 
         if not passed:
