@@ -1,5 +1,5 @@
 """
-company_ingest.py — 회사 문서 배치 파싱 파이프라인
+company_ingest.py — 회사 문서 배치 인제스트 파이프라인
 
 역할:
   - data/raw/company/ 하위 모든 PDF를 스캔
@@ -7,16 +7,14 @@ company_ingest.py — 회사 문서 배치 파싱 파이프라인
   - 신규 파일만 Gemini API로 파싱 → vector_chunks.json 저장
   - 실패 시 최대 MAX_RETRIES회 재시도 (지수 백오프)
   - 최종 실패 파일은 failed_parse.log에 기록
-
-다음 단계:
-  company_vectordb.py 실행 → ChromaDB 적재
+  - 파싱 완료 후 자동으로 ChromaDB 적재까지 실행
 
 사용법:
   cd src && uv run python company_ingest.py
 
 신규 PDF 추가 시:
   data/raw/company/{폴더}/새파일.pdf 를 넣고 이 스크립트 재실행
-  → 새 파일만 파싱, 나머지는 스킵
+  → 새 파일만 파싱, 나머지는 스킵 → ChromaDB 자동 적재
 """
 
 import asyncio
@@ -27,6 +25,7 @@ from typing import List, Tuple
 
 from dotenv import load_dotenv
 
+from company_vectordb import upsert_all
 from pdf_parser import parse_single_pdf
 
 load_dotenv()
@@ -160,8 +159,16 @@ async def parse_all() -> None:
             print(f"  x {name}: {reason}")
         print(f"\n  로그 위치: {FAILED_LOG_PATH}")
 
-    print("\n다음 단계: uv run python company_vectordb.py")
     print("=" * 55)
+
+    # -------------------------------------------------------------------------
+    # 4. 파싱된 파일이 있으면 ChromaDB 적재 자동 실행
+    # -------------------------------------------------------------------------
+    if parsed_files or skipped_files:
+        print("\nChromaDB 적재 시작...")
+        upsert_all()
+    else:
+        print("\n적재할 파일 없음 (파싱 성공 파일 0개).")
 
 
 def main():
