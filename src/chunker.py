@@ -2,6 +2,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+# =============================================================================
+# Config
+# =============================================================================
+CHUNKER_CONFIG = {
+    "section_max_len": 1500,   # 이 길이 이하 섹션은 1개 청크로 유지
+    "group_max_len":   1300,   # 긴 섹션을 문단 그룹으로 나눌 때 최대 길이
+}
+
 
 # ---------------------------------------------------------------------------
 # 내부 분리 헬퍼
@@ -123,8 +131,9 @@ def split_markdown_into_chunks(
     document_id: str,
     source_pdf: Path,
     model_name: str,
-    section_max_len: int = 1500,
-    group_max_len: int = 1300,
+    source_type: str = "gemini_file_api_markdown",
+    section_max_len: int = CHUNKER_CONFIG["section_max_len"],
+    group_max_len: int = CHUNKER_CONFIG["group_max_len"],
 ) -> List[Dict[str, Any]]:
     """
     RAG용 chunking:
@@ -192,9 +201,8 @@ def split_markdown_into_chunks(
             "source_file": source_pdf.name,
             "section_order": sec_idx,
             "header": sec["header"],
-            "source": "gemini_file_api_markdown",
+            "source": source_type,
             "model": model_name,
-            "mode": "fast_gemini_file_api",
         }
 
         # 이 섹션의 청크를 먼저 수집 → chunk_position 계산 후 추가
