@@ -10,9 +10,9 @@
 - 이미 처리된 문서는 건너뛰고 신규 문서만 파싱
 - 파싱 실패 시 재시도
 - 최종 실패 문서는 로그로 기록
-- 이후 벡터 DB 적재 단계로 자연스럽게 연결
+- 파싱 완료 후 ChromaDB 적재까지 자동 실행 (one-command)
 
-즉, 이 모듈은 **원천 PDF 문서 수집 이후 파싱 단계 전체를 자동화하는 배치 실행 진입점**이다.
+즉, 이 모듈은 **PDF 수집부터 ChromaDB 적재까지 전 과정을 명령어 하나로 완료하는 인제스트 자동화 진입점**이다.
 
 ---
 
@@ -28,8 +28,9 @@
 - 실패 시 재시도 및 백오프 처리
 - 최종 실패 항목을 `failed_parse.log`에 기록
 - 전체 실행 결과를 요약 출력
+- 파싱 완료 후 `company_vectordb.upsert_all()` 자동 호출
 
-즉, 개별 PDF 파싱 로직 자체는 `pdf_parser.py`에 있고, 이 파일은 **여러 문서를 한 번에 처리하는 배치 관리 계층**이라고 볼 수 있다.
+즉, 개별 PDF 파싱 로직은 `pdf_parser.py`가, 적재 로직은 `company_vectordb.py`가 담당하며, 이 파일은 **전체 파이프라인을 한 번에 실행하는 배치 오케스트레이터**이다.
 
 ---
 
@@ -175,7 +176,9 @@
 - 스킵 수
 - 실패 수
 - 실패 파일 목록
-- 다음 단계 실행 안내
+
+### 8. ChromaDB 적재 자동 실행
+파싱 성공 파일이 있으면 `company_vectordb.upsert_all()`을 자동으로 호출하여 ChromaDB 적재까지 완료한다.
 
 ---
 
@@ -196,8 +199,9 @@
 
 ### 내부 의존성
 - `pdf_parser.parse_single_pdf`
+- `company_vectordb.upsert_all`
 
-이 파일은 실제 PDF 파싱 로직을 직접 구현하지 않고, `pdf_parser.py`의 단일 문서 파싱 함수를 호출한다.
+파싱 로직은 `pdf_parser.py`가, ChromaDB 적재 로직은 `company_vectordb.py`가 담당한다.
 
 ### 외부 라이브러리
 - `asyncio`
@@ -241,14 +245,13 @@
 ## 이 파일이 프로젝트에서 갖는 의미
 `company_ingest.py`는 회사 문서 기반 RAG 시스템에서 **원본 문서를 파싱 가능한 구조로 변환하는 배치 진입점**이다.
 
-전체 파이프라인 기준으로 보면 다음 흐름의 시작점에 해당한다.
+전체 파이프라인 기준으로 보면 다음 흐름 전체를 하나의 명령어로 실행한다.
 
 1. 회사 PDF 수집
-2. `company_ingest.py`로 파싱
-3. `company_vectordb.py`로 ChromaDB 적재
-4. `rag_chain.py`를 통한 검색 및 질의응답
+2. `company_ingest.py` 실행 → 파싱 + ChromaDB 적재 자동 완료
+3. `rag_chain.py`를 통한 검색 및 질의응답
 
-즉, 이 파일은 **문서 수집 단계와 벡터 검색 단계 사이를 연결하는 전처리 자동화 스크립트**이다.
+즉, 이 파일은 **문서 수집 이후 챗봇 사용 가능 상태까지 전 과정을 one-command로 완료하는 인제스트 진입점**이다.
 
 ---
 
@@ -261,6 +264,6 @@ cd src && uv run python company_ingest.py
 ```
 
 ---
-최종 수정: 2026-03-17
+최종 수정: 2026-03-19
 관련 파일: 'src/company_ingest.py'
 ---

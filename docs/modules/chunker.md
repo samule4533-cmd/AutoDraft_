@@ -118,8 +118,9 @@ RAG 시스템에서 청킹 품질은 검색 정확도와 답변 품질에 직접
 - `document_id`: 문서 식별자
 - `source_pdf`: 원본 PDF 경로
 - `model_name`: 문서 변환에 사용한 모델명
-- `section_max_len`: 섹션 전체를 단일 청크로 유지할 최대 길이
-- `group_max_len`: 문단 그룹 또는 표 조각의 최대 길이
+- `source_type`: 문서 출처 식별자 (기본값 `"gemini_file_api_markdown"`, 공고문 등 다른 소스 연동 시 변경)
+- `section_max_len`: 섹션 전체를 단일 청크로 유지할 최대 길이 (기본값 `CHUNKER_CONFIG`에서 참조)
+- `group_max_len`: 문단 그룹 또는 표 조각의 최대 길이 (기본값 `CHUNKER_CONFIG`에서 참조)
 
 #### 출력
 벡터 DB 적재에 사용할 청크 리스트. 각 원소는 다음 구조를 가진다.
@@ -134,16 +135,26 @@ RAG 시스템에서 청킹 품질은 검색 정확도와 답변 품질에 직접
         "source_file": "...",
         "section_order": ...,
         "header": "...",
-        "source": "...",
+        "source": "...",   # source_type 파라미터 값 (기본: "gemini_file_api_markdown")
         "model": "...",
-        "mode": "...",
         "chunk_type": "...",
         "has_table": ...,
         "chunk_position": "only|first|middle|last"
     }
 }
+```
+
+### `CHUNKER_CONFIG`
+청크 크기 관련 설정을 한 곳에 모아둔 딕셔너리이다.
+
+#### 포함 항목
+- `section_max_len`: 1500 — 이 길이 이하 섹션은 1개 청크로 유지
+- `group_max_len`: 1300 — 긴 섹션을 문단 그룹으로 나눌 때 최대 길이
+
+#### 목적
+청크 크기를 조정할 때 함수 시그니처를 건드리지 않고 이 설정만 수정하면 된다.
 
 ---
-최종 수정: 2026-03-17
+최종 수정: 2026-03-19
 관련 파일: 'src/chunker.py'
 ---
