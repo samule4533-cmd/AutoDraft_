@@ -15,8 +15,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from rag_chain import RAG_CONFIG, RagResult, ask
-from vector_db import get_or_create_collection
+from src.rag_chain import RAG_CONFIG, RagResult, ask
+from src.vector_db import get_or_create_collection
 
 load_dotenv()
 
