@@ -314,27 +314,29 @@ export default function App() {
               {conversations.find(c => c.id === activeId)?.title}
             </span>
           )}
-          <button className="summary-btn" onClick={openSummary} title="AI 문서 요약">
-            AI 요약
-          </button>
+          <div className="summary-btn-wrap">
+            <button className="summary-btn" onClick={openSummary}>
+              AI 요약
+            </button>
+            <span className="summary-tooltip">적재된 문서를 AI가 자동으로 요약합니다</span>
+          </div>
         </header>
 
         {messages.length === 0 ? (
           /* ── 빈 상태: 입력창 중앙 ── */
           <div className="chat-empty-state">
-            <p className="empty-hint">사내 문서에 대해 질문해보세요.</p>
+            <p className="empty-hint">사내 특허, 문서 내용을 질문해보세요.</p>
             <div className="query-guide">
               <p className="guide-title">💡 이런 질문을 해보세요</p>
               <ul className="guide-list">
-                <li>등록된 파일이 궁금하면 &nbsp;<span className="guide-example">"파일 몇 개 있어?"</span></li>
-                <li>특정 주제 자료가 있는지 &nbsp;<span className="guide-example">"~ 관련 자료 있어?"</span></li>
-                <li>문서 내용이 궁금하면 &nbsp;<span className="guide-example">"~의 핵심 기술이 뭐야?"</span></li>
-                <li>이전 답변 이어서 &nbsp;<span className="guide-example">"그럼 거기서 ~은?"</span></li>
+                <li><span className="guide-example">"우리 회사에 업로드된 파일이 몇 개 있어?"</span></li>
+                <li><span className="guide-example">"에너지 관련 특허가 있어?"</span></li>
+                <li><span className="guide-example">"건물 모델링 기술자료 찾아줘"</span></li>
               </ul>
             </div>
             <div className="input-row">
               <textarea
-                ref={inputRef}
+                ref={inputRef}ㄴ
                 className="input"
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -408,7 +410,10 @@ export default function App() {
         <div className="summary-overlay" onClick={() => setSummaryOpen(false)}>
           <div className="summary-panel" onClick={e => e.stopPropagation()}>
             <div className="summary-panel-header">
-              <span className="summary-panel-title">📄 AI 문서 요약</span>
+              <div>
+                <span className="summary-panel-title">📄 AI 문서 요약</span>
+                <p className="summary-panel-subtitle">적재된 문서를 AI가 자동으로 요약합니다</p>
+              </div>
               <button className="summary-close" onClick={() => setSummaryOpen(false)}>×</button>
             </div>
 

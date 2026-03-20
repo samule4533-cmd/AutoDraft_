@@ -286,9 +286,9 @@
 .query-guide {
   margin: 20px 0 8px;
   padding: 16px 20px;
-  background: #1e1e1e;
-  border: 1px solid #2e2e2e;
-  border-radius: 10px;
+  background: #fff;
+  border: 1px solid #ddd5f5;
+  border-radius: 18px;
   width: 100%;
   max-width: 560px;
   box-sizing: border-box;
@@ -296,7 +296,8 @@
 
 .guide-title {
   font-size: 13px;
-  color: #888;
+  font-weight: 600;
+  color: #08060d;
   margin: 0 0 10px;
 }
 
@@ -311,12 +312,13 @@
 
 .guide-list li {
   font-size: 13px;
-  color: #999;
+  color: #08060d;
 }
 
 .guide-example {
-  color: #c8a96e;
+  color: #08060d;
   font-style: italic;
+  font-weight: 500;
 }
 
 /* ── 채팅 영역 ── */
@@ -478,8 +480,13 @@
 }
 
 /* ── AI 요약 버튼 (헤더) ── */
-.summary-btn {
+.summary-btn-wrap {
   margin-left: auto;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.summary-btn {
   padding: 6px 14px;
   border: 1px solid #aa3bff;
   border-radius: 8px;
@@ -488,13 +495,40 @@
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  flex-shrink: 0;
   transition: background 0.15s, color 0.15s;
 }
 
 .summary-btn:hover {
   background: #aa3bff;
   color: #fff;
+}
+
+.summary-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: #08060d;
+  color: #fff;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.summary-tooltip::before {
+  content: '';
+  position: absolute;
+  bottom: 100%;
+  right: 14px;
+  border: 5px solid transparent;
+  border-bottom-color: #08060d;
+}
+
+.summary-btn-wrap:hover .summary-tooltip {
+  opacity: 1;
 }
 
 /* ── 요약 오버레이 ── */
@@ -534,6 +568,12 @@
   font-size: 15px;
   font-weight: 700;
   color: #08060d;
+}
+
+.summary-panel-subtitle {
+  font-size: 12px;
+  color: #aaa;
+  margin: 3px 0 0;
 }
 
 .summary-close {
