@@ -8,8 +8,8 @@
 .sidebar {
   width: 260px;
   flex-shrink: 0;
-  background: #f9f8fc;
-  border-right: 1px solid #e5e4e7;
+  background: #f4f6f9;
+  border-right: 2px solid #d4d2d8;
   display: flex;
   flex-direction: column;
   padding: 16px 12px;
@@ -46,7 +46,7 @@
 }
 
 .new-chat-btn:hover {
-  background: #f0ecf8;
+  background: #eff6ff;
 }
 
 .search-btn {
@@ -61,12 +61,12 @@
 }
 
 .search-btn:hover {
-  background: #f0ecf8;
+  background: #eff6ff;
 }
 
 .search-btn.active {
-  background: #ede8f5;
-  border-color: #aa3bff;
+  background: #dbeafe;
+  border-color: #2563eb;
 }
 
 /* ── 검색 입력창 ── */
@@ -85,7 +85,7 @@
 }
 
 .search-input:focus {
-  border-color: #aa3bff;
+  border-color: #2563eb;
 }
 
 .conv-divider {
@@ -125,13 +125,13 @@
 }
 
 .conv-item:hover {
-  background: #f0ecf8;
-  border-color: #c9bfe0;
+  background: #eff6ff;
+  border-color: #bfdbfe;
 }
 
 .conv-item.active {
-  background: #ede8f5;
-  border-color: #aa3bff;
+  background: #dbeafe;
+  border-color: #2563eb;
 }
 
 .conv-title {
@@ -149,7 +149,7 @@
   font-family: inherit;
   color: #3a3344;
   background: #fff;
-  border: 1px solid #aa3bff;
+  border: 1px solid #2563eb;
   border-radius: 4px;
   padding: 1px 6px;
   outline: none;
@@ -211,10 +211,10 @@
 }
 
 .logo {
-  font-size: 18px;
-  font-weight: 700;
+  font-size: 20px;
+  font-weight: 800;
   color: #08060d;
-  letter-spacing: -0.3px;
+  letter-spacing: -0.5px;
   flex-shrink: 0;
 }
 
@@ -251,7 +251,7 @@
 }
 
 .sidebar-toggle:hover {
-  background: #f0ecf8;
+  background: #eff6ff;
 }
 
 .sidebar-toggle span {
@@ -270,7 +270,7 @@
   justify-content: center;
   align-items: center;
   gap: 20px;
-  padding: 0 40px 10%;
+  padding: 0 40px 6%;
   max-width: 760px;
   width: 100%;
   margin: 0 auto;
@@ -278,17 +278,20 @@
 }
 
 .empty-hint {
-  color: #aaa;
-  font-size: 16px;
+  color: #08060d;
+  font-size: 21px;
+  font-weight: 700;
   margin: 0;
+  letter-spacing: -0.3px;
 }
 
 .query-guide {
   margin: 20px 0 8px;
   padding: 16px 20px;
   background: #fff;
-  border: 1px solid #ddd5f5;
+  border: 1px solid #e5e4e7;
   border-radius: 18px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
   width: 100%;
   max-width: 560px;
   box-sizing: border-box;
@@ -298,27 +301,32 @@
   font-size: 13px;
   font-weight: 600;
   color: #08060d;
-  margin: 0 0 10px;
+  margin: 0 0 12px;
 }
 
-.guide-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
+.guide-pills {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 8px;
 }
 
-.guide-list li {
+.guide-pill {
+  text-align: left;
+  padding: 9px 14px;
+  border: 1px solid #e5e4e7;
+  border-radius: 10px;
+  background: #f9f9f9;
   font-size: 13px;
-  color: #08060d;
+  color: #3a3344;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  font-family: inherit;
 }
 
-.guide-example {
-  color: #08060d;
-  font-style: italic;
-  font-weight: 500;
+.guide-pill:hover {
+  background: #eff6ff;
+  border-color: #2563eb;
+  color: #2563eb;
 }
 
 /* ── 채팅 영역 ── */
@@ -358,8 +366,40 @@
   word-break: break-word;
 }
 
+/* ── 복사 버튼 ── */
+.bubble {
+  position: relative;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #aaa;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+}
+
+.copy-btn:hover {
+  background: #e8e8e8;
+  color: #555;
+}
+
+.bubble-row.assistant:hover .copy-btn {
+  opacity: 1;
+}
+
 .bubble-row.user .bubble {
-  background: #aa3bff;
+  background: #2563eb;
   color: #fff;
   border-bottom-right-radius: 3px;
 }
@@ -413,8 +453,8 @@
   font-size: 12px;
   padding: 3px 8px;
   border-radius: 99px;
-  background: #f0e8ff;
-  color: #7c3aed;
+  background: #eff6ff;
+  color: #2563eb;
   cursor: default;
 }
 
@@ -451,18 +491,20 @@
   font-family: inherit;
   line-height: 1.5;
   outline: none;
-  transition: border-color 0.15s;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .input:focus {
-  border-color: #aa3bff;
+  border-color: #2563eb;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.12);
 }
 
 .send-btn {
   padding: 0 20px;
   border: none;
   border-radius: 10px;
-  background: #aa3bff;
+  background: #2563eb;
   color: #fff;
   font-size: 14px;
   font-weight: 600;
@@ -488,10 +530,10 @@
 
 .summary-btn {
   padding: 6px 14px;
-  border: 1px solid #aa3bff;
+  border: 1px solid #2563eb;
   border-radius: 8px;
   background: transparent;
-  color: #aa3bff;
+  color: #2563eb;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -499,7 +541,7 @@
 }
 
 .summary-btn:hover {
-  background: #aa3bff;
+  background: #2563eb;
   color: #fff;
 }
 
@@ -507,7 +549,7 @@
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  background: #08060d;
+  background: rgba(50, 50, 55, 0.88);
   color: #fff;
   font-size: 12px;
   padding: 6px 10px;
@@ -515,6 +557,7 @@
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
   transition: opacity 0.15s;
 }
 
@@ -524,7 +567,7 @@
   bottom: 100%;
   right: 14px;
   border: 5px solid transparent;
-  border-bottom-color: #08060d;
+  border-bottom-color: rgba(50, 50, 55, 0.88);
 }
 
 .summary-btn-wrap:hover .summary-tooltip {
@@ -593,7 +636,7 @@
 
 .summary-close:hover {
   color: #333;
-  background: #f0ecf8;
+  background: #eff6ff;
 }
 
 .summary-panel-body {
@@ -633,7 +676,7 @@
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: #aa3bff;
+  background: #2563eb;
   color: #fff;
   font-size: 11px;
   font-weight: 700;

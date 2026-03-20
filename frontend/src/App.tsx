@@ -88,6 +88,13 @@ export default function App() {
   const [lastResult, setLastResult] = useState<RagResult | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [summaryOpen, setSummaryOpen] = useState(false)
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
+
+  function copyMessage(text: string, index: number) {
+    navigator.clipboard.writeText(text)
+    setCopiedIndex(index)
+    setTimeout(() => setCopiedIndex(null), 1500)
+  }
   const [summaries, setSummaries] = useState<SummaryItem[]>([])
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [summaryError, setSummaryError] = useState<string | null>(null)
@@ -287,7 +294,7 @@ export default function App() {
                   {conv.title}
                 </span>
               )}
-              {searchMode && editingId !== conv.id && (
+              {editingId !== conv.id && (
                 <span className="conv-date">{formatDate(conv.createdAt)}</span>
               )}
               <button
@@ -308,7 +315,7 @@ export default function App() {
           <button className="sidebar-toggle" onClick={() => setSidebarOpen(v => !v)} title="메뉴">
             <span /><span /><span />
           </button>
-          <span className="logo">AutoDraft</span>
+          <span className="logo" onClick={startNewChat} style={{ cursor: 'pointer' }}>AutoDraft</span>
           {activeId && messages.length > 0 && (
             <span className="chat-title">
               {conversations.find(c => c.id === activeId)?.title}
@@ -316,9 +323,9 @@ export default function App() {
           )}
           <div className="summary-btn-wrap">
             <button className="summary-btn" onClick={openSummary}>
-              AI 요약
+              사내 자료 AI 요약
             </button>
-            <span className="summary-tooltip">적재된 문서를 AI가 자동으로 요약합니다</span>
+            <span className="summary-tooltip">적재된 사내 자료의 핵심 내용을 요약합니다!</span>
           </div>
         </header>
 
@@ -328,11 +335,17 @@ export default function App() {
             <p className="empty-hint">사내 특허, 문서 내용을 질문해보세요.</p>
             <div className="query-guide">
               <p className="guide-title">💡 이런 질문을 해보세요</p>
-              <ul className="guide-list">
-                <li><span className="guide-example">"우리 회사에 업로드된 파일이 몇 개 있어?"</span></li>
-                <li><span className="guide-example">"에너지 관련 특허가 있어?"</span></li>
-                <li><span className="guide-example">"건물 모델링 기술자료 찾아줘"</span></li>
-              </ul>
+              <div className="guide-pills">
+                <button className="guide-pill" onClick={() => setInput('우리 회사에 업로드된 파일이 몇 개 있어?')}>
+                  우리 회사에 업로드된 파일이 몇 개 있어?
+                </button>
+                <button className="guide-pill" onClick={() => setInput('에너지 관련 특허가 있어?')}>
+                  에너지 관련 특허가 있어?
+                </button>
+                <button className="guide-pill" onClick={() => setInput('건물 모델링 기술자료 찾아줘')}>
+                  건물 모델링 기술자료 찾아줘
+                </button>
+              </div>
             </div>
             <div className="input-row">
               <textarea
@@ -360,6 +373,14 @@ export default function App() {
                     {msg.role === 'assistant'
                       ? <ReactMarkdown>{msg.content}</ReactMarkdown>
                       : msg.content}
+                    {msg.role === 'assistant' && (
+                      <button className="copy-btn" onClick={() => copyMessage(msg.content, i)} title="복사">
+                        {copiedIndex === i
+                          ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                          : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        }
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
