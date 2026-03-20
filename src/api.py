@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.rag_chain import RAG_CONFIG, RagResult, ask
+from src.summary_service import get_summaries
 from src.vector_db import get_or_create_collection
 
 load_dotenv()
@@ -162,6 +163,32 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")
 
     return result
+
+
+# =============================================================================
+# 출력 스키마
+# =============================================================================
+class SummaryItem(BaseModel):
+    index:    int
+    filename: str
+    summary:  str
+
+
+# =============================================================================
+# 요약 엔드포인트
+# =============================================================================
+@app.get("/summaries", response_model=list[SummaryItem])
+def summaries():
+    """
+    전체 사내 문서 AI 요약 목록을 반환한다.
+    캐시가 있으면 즉시 반환하고, 새 파일이 추가된 경우에만 Gemini를 호출한다.
+    """
+    logger.info("GET /summaries")
+    try:
+        return get_summaries()
+    except Exception as e:
+        logger.error("요약 생성 실패: %s", e)
+        raise HTTPException(status_code=500, detail="요약 생성 중 오류가 발생했습니다.")
 
 
 # =============================================================================

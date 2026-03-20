@@ -476,3 +476,143 @@
 .send-btn:not(:disabled):hover {
   opacity: 0.85;
 }
+
+/* ── AI 요약 버튼 (헤더) ── */
+.summary-btn {
+  margin-left: auto;
+  padding: 6px 14px;
+  border: 1px solid #aa3bff;
+  border-radius: 8px;
+  background: transparent;
+  color: #aa3bff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.summary-btn:hover {
+  background: #aa3bff;
+  color: #fff;
+}
+
+/* ── 요약 오버레이 ── */
+.summary-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 100;
+}
+
+/* ── 요약 패널 ── */
+.summary-panel {
+  background: #fff;
+  border-radius: 14px;
+  width: 600px;
+  max-width: 90vw;
+  max-height: 78vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+
+.summary-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e5e4e7;
+  flex-shrink: 0;
+}
+
+.summary-panel-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #08060d;
+}
+
+.summary-close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  font-size: 20px;
+  color: #aaa;
+  cursor: pointer;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.12s, background 0.12s;
+}
+
+.summary-close:hover {
+  color: #333;
+  background: #f0ecf8;
+}
+
+.summary-panel-body {
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.summary-status {
+  text-align: center;
+  color: #aaa;
+  font-size: 14px;
+  padding: 24px 0;
+}
+
+.summary-status.error {
+  color: #e53e3e;
+}
+
+.summary-item {
+  padding: 14px 16px;
+  border: 1px solid #e5e4e7;
+  border-radius: 10px;
+  background: #fafafa;
+}
+
+.summary-item-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.summary-index {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #aa3bff;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.summary-filename {
+  font-size: 13px;
+  font-weight: 600;
+  color: #3a3344;
+  word-break: break-all;
+}
+
+.summary-text {
+  font-size: 13px;
+  color: #555;
+  line-height: 1.6;
+  margin: 0;
+}

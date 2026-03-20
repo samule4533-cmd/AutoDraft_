@@ -24,6 +24,12 @@ interface RagResult {
   reformulated_query: string | null
 }
 
+interface SummaryItem {
+  index: number
+  filename: string
+  summary: string
+}
+
 interface Conversation {
   id: string
   title: string
@@ -51,6 +57,12 @@ function saveConversations(convs: Conversation[]) {
 // ──────────────────────────────────────────────
 // API 호출
 // ──────────────────────────────────────────────
+async function fetchSummaries(): Promise<SummaryItem[]> {
+  const res = await fetch('/summaries')
+  if (!res.ok) throw new Error(`서버 오류 ${res.status}`)
+  return res.json()
+}
+
 async function callChat(query: string, history: ChatMessage[]): Promise<RagResult> {
   const res = await fetch('/chat', {
     method: 'POST',
@@ -75,6 +87,10 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [lastResult, setLastResult] = useState<RagResult | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [summaryOpen, setSummaryOpen] = useState(false)
+  const [summaries, setSummaries] = useState<SummaryItem[]>([])
+  const [summaryLoading, setSummaryLoading] = useState(false)
+  const [summaryError, setSummaryError] = useState<string | null>(null)
   const [searchMode, setSearchMode] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -124,6 +140,20 @@ export default function App() {
   useEffect(() => {
     if (!loading) inputRef.current?.focus()
   }, [loading])
+
+  async function openSummary() {
+    setSummaryOpen(true)
+    setSummaryError(null)
+    setSummaryLoading(true)
+    try {
+      const data = await fetchSummaries()
+      setSummaries(data)
+    } catch {
+      setSummaryError('요약을 불러오지 못했습니다. 서버 상태를 확인해주세요.')
+    } finally {
+      setSummaryLoading(false)
+    }
+  }
 
   function startNewChat() {
     setActiveId(null)
@@ -284,6 +314,9 @@ export default function App() {
               {conversations.find(c => c.id === activeId)?.title}
             </span>
           )}
+          <button className="summary-btn" onClick={openSummary} title="AI 문서 요약">
+            AI 요약
+          </button>
         </header>
 
         {messages.length === 0 ? (
@@ -370,6 +403,35 @@ export default function App() {
           </>
         )}
       </div>
+      {/* ── AI 요약 패널 ── */}
+      {summaryOpen && (
+        <div className="summary-overlay" onClick={() => setSummaryOpen(false)}>
+          <div className="summary-panel" onClick={e => e.stopPropagation()}>
+            <div className="summary-panel-header">
+              <span className="summary-panel-title">📄 AI 문서 요약</span>
+              <button className="summary-close" onClick={() => setSummaryOpen(false)}>×</button>
+            </div>
+
+            <div className="summary-panel-body">
+              {summaryLoading && (
+                <div className="summary-status">요약 생성 중...</div>
+              )}
+              {summaryError && (
+                <div className="summary-status error">{summaryError}</div>
+              )}
+              {!summaryLoading && !summaryError && summaries.map(item => (
+                <div key={item.index} className="summary-item">
+                  <div className="summary-item-header">
+                    <span className="summary-index">{item.index}</span>
+                    <span className="summary-filename">{item.filename}</span>
+                  </div>
+                  <p className="summary-text">{item.summary}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -36,11 +36,11 @@ RAG_CONFIG = {
     "max_context_chars":  6000,
 }
 
-# fallback 메시지
-_MSG_NO_DOCS         = "사내 문서에서 해당 내용을 찾을 수 없습니다."
+# fallback 메시지 (에러 상황 전용)
 _MSG_RETRIEVAL_ERROR = "문서 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
 _MSG_LLM_ERROR       = "답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
 
+# 사내 문서 RAG 답변용 — 관련 청크가 있을 때 사용
 SYSTEM_PROMPT = """\
 당신은 회사 내부 문서를 기반으로 질문에 답하는 어시스턴트입니다.
 
@@ -56,6 +56,22 @@ SYSTEM_PROMPT = """\
 4. 표, 수치, 날짜는 원문 그대로 인용하라.
 5. 한국어로 답하라.
 6. 핵심만 간결하게 3~5문장 이내로 답하라. 불필요한 배경 설명이나 서론은 생략한다.
+"""
+
+# 일반 대화용 — 관련 청크가 없을 때 사용
+_CHITCHAT_SYSTEM_PROMPT = """\
+당신은 회사 내부 문서 어시스턴트입니다.
+이 질문에 해당하는 사내 문서를 찾지 못했습니다.
+
+[판단 기준]
+- 질문이 회사·업무·사내 문서와 관련된 내용이면:
+  "사내 문서에서 해당 내용을 찾을 수 없습니다."라고만 답하라.
+- 인사·잡담·일반 지식·추천 등 문서와 무관한 대화라면:
+  자연스럽고 친근하게 답하라.
+
+[공통 규칙]
+- 한국어로 답하라.
+- 간결하게 답하라.
 """
 
 
@@ -368,6 +384,60 @@ def format_citations(chunks: list[dict]) -> list[Citation]:
     return result
 
 
+def _handle_chitchat(
+    ctx: QueryContext,
+    req_id: str,
+    chat_history: list | None,
+    retrieved_count: int,
+    top_distance: float | None,
+) -> RagResult:
+    """
+    벡터 검색 통과 청크가 0개일 때 호출된다.
+    Gemini가 직접 판단해:
+      - 회사·문서 관련 질문 → "사내 문서에서 해당 내용을 찾을 수 없습니다" 안내
+      - 일반 대화·잡담·일반 지식 → 자유 답변
+    """
+    history = trim_history(chat_history) if chat_history else None
+    history_block = ""
+    if history:
+        lines = [
+            f"{'사용자' if m.get('role') == 'user' else '어시스턴트'}: {m.get('content', '')}"
+            for m in history
+        ]
+        history_block = "\n[이전 대화]\n" + "\n".join(lines) + "\n"
+
+    prompt = (
+        f"{_CHITCHAT_SYSTEM_PROMPT}"
+        f"{history_block}\n"
+        f"[질문]\n{ctx.original_query}"
+    )
+
+    try:
+        answer = generate_answer(prompt, req_id)
+    except Exception as e:
+        logger.error("[%s] chit-chat LLM 호출 실패: %s", req_id, e)
+        return _make_fallback(
+            ctx, "llm_error", _MSG_LLM_ERROR,
+            retrieved_count=retrieved_count,
+            top_distance=top_distance,
+        )
+
+    logger.info("[%s] chit-chat 응답 완료: %d자", req_id, len(answer))
+    return RagResult(
+        answer=             answer,
+        citations=          [],
+        query_type=         ctx.query_type,
+        used_query=         ctx.search_query,
+        reformulated_query= ctx.reformulated,
+        understood_query=   ctx.understood,
+        retrieved_count=    retrieved_count,
+        passed_threshold=   0,
+        top_distance=       top_distance,
+        fallback=           False,
+        fallback_reason=    None,
+    )
+
+
 def _handle_content(
     ctx: QueryContext,
     req_id: str,
@@ -385,9 +455,9 @@ def _handle_content(
     # 필터
     passed = filter_by_threshold(chunks, req_id)
     if not passed:
-        logger.info("[%s] 통과 청크 0개 → fallback", req_id)
-        return _make_fallback(
-            ctx, "no_docs", _MSG_NO_DOCS,
+        logger.info("[%s] 통과 청크 0개 → chit-chat 핸들러 위임", req_id)
+        return _handle_chitchat(
+            ctx, req_id, chat_history,
             retrieved_count=len(chunks),
             top_distance=chunks[0]["distance"] if chunks else None,
         )
@@ -447,6 +517,8 @@ def ask(
            meta      → handle_meta_query()
            existence → handle_existence_query()
            content   → _handle_content()
+                         └ 청크 0개 → _handle_chitchat()
+                              └ Gemini 판단: 문서 관련 → "없습니다" / 일반 대화 → 자유 답변
     """
     req_id = uuid.uuid4().hex[:8]
     logger.info("[%s] 질문 수신: %.80s", req_id, query)
@@ -503,7 +575,9 @@ _TEST_CASES = [
     ("수치/날짜 질문",           "건물 에너지 모델링 자동화 시스템 특허의 출원일은 언제야?"),
     ("구어체 질문",             "출원일 알려줘"),
     ("문서에 없는 질문",         "직원 복지 정책이 나와있어?"),
-    ("엉뚱한 질문",             "서울날씨 알려줘"),
+    ("일반 대화 — 날씨",        "서울날씨 알려줘"),
+    ("일반 대화 — 인사",        "ㅎㅇ"),
+    ("일반 대화 — 추천",        "오늘 점심 뭐 먹을까"),
 ]
 
 
