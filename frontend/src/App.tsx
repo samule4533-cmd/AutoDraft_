@@ -325,7 +325,7 @@ export default function App() {
             <button className="summary-btn" onClick={openSummary}>
               사내 자료 AI 요약
             </button>
-            <span className="summary-tooltip">적재된 사내 자료의 핵심 내용을 요약합니다!</span>
+            <span className="summary-tooltip">적재된 사내 자료의 핵심 내용을 요약합니다</span>
           </div>
         </header>
 
@@ -349,7 +349,7 @@ export default function App() {
             </div>
             <div className="input-row">
               <textarea
-                ref={inputRef}ㄴ
+                ref={inputRef}
                 className="input"
                 value={input}
                 onChange={e => setInput(e.target.value)}

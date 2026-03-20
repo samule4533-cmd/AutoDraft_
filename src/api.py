@@ -197,4 +197,4 @@ def summaries():
 if __name__ == "__main__":
     # reload=True: 코드 변경 시 서버 자동 재시작 (개발용)
     # 운영 배포 시 reload=False, workers=N으로 변경한다.
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)
