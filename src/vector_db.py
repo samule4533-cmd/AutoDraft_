@@ -182,24 +182,29 @@ def get_embedding_function(
 # =============================================================================
 # ChromaDB 클라이언트 캐시
 # =============================================================================
-# PersistentClient는 SQLite 파일을 열고 내부 인덱스를 로딩하는 비용이 있다.
-# 챗봇 환경에서는 쿼리마다 새 클라이언트를 만들면 응답 지연이 쌓인다.
-# persist_dir 경로를 키로 최초 1회만 초기화하고 이후엔 재사용한다.
-#
-# [스레드 안전성]
-# CPython의 GIL이 딕셔너리 읽기/쓰기를 원자적으로 보호한다.
-# ChromaDB PersistentClient 자체도 내부적으로 동시 접근을 처리한다.
-# Phase 1 단일 프로세스 환경에서는 추가 Lock 불필요.
-_chroma_client_cache: Dict[str, chromadb.PersistentClient] = {}
+# CHROMA_HOST 환경변수가 설정되면 HttpClient(Docker ChromaDB)를 사용한다.
+# 설정되지 않으면 PersistentClient(로컬 파일)를 사용한다 (로컬 개발 fallback).
+# 동일 연결 대상에 대해 프로세스 수명 동안 단 하나의 클라이언트만 유지한다.
+_chroma_client_cache: Dict[str, Any] = {}
 
 
-def _get_or_init_client(persist_dir: str) -> chromadb.PersistentClient:
+def _get_or_init_client(persist_dir: str) -> Any:
     """
-    ChromaDB PersistentClient를 경로별로 캐싱해 반환한다.
-    같은 persist_dir에 대해 프로세스 수명 동안 단 하나의 클라이언트만 유지한다.
+    CHROMA_HOST 환경변수 유무에 따라 HttpClient 또는 PersistentClient를 반환한다.
+    - CHROMA_HOST 설정 시: HttpClient (AutoDraft_ingest Docker ChromaDB 연결)
+    - 미설정 시: PersistentClient (로컬 파일, 개발용 fallback)
     """
+    chroma_host = os.getenv("CHROMA_HOST", "").strip()
+    if chroma_host:
+        port = int(os.getenv("CHROMA_PORT", "8000"))
+        cache_key = f"http://{chroma_host}:{port}"
+        if cache_key not in _chroma_client_cache:
+            logger.debug("ChromaDB HttpClient 초기화: %s", cache_key)
+            _chroma_client_cache[cache_key] = chromadb.HttpClient(host=chroma_host, port=port)
+        return _chroma_client_cache[cache_key]
+
     if persist_dir not in _chroma_client_cache:
-        logger.debug("ChromaDB 클라이언트 초기화: %s", persist_dir)
+        logger.debug("ChromaDB PersistentClient 초기화: %s", persist_dir)
         _chroma_client_cache[persist_dir] = chromadb.PersistentClient(path=persist_dir)
     return _chroma_client_cache[persist_dir]
 

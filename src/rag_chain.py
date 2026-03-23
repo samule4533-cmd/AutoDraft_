@@ -31,7 +31,7 @@ RAG_CONFIG = {
     "embedding_provider": os.getenv("EMBEDDING_PROVIDER", "local"),
     "gemini_model":       os.getenv("GEMINI_RAG_MODEL", "gemini-2.0-flash"),
     "n_results":          10,
-    "distance_threshold":           0.65,
+    "distance_threshold":           0.55,
     "existence_distance_threshold": 0.65,
     "max_context_chars":  6000,
 }
@@ -56,6 +56,8 @@ SYSTEM_PROMPT = """\
 4. 표, 수치, 날짜는 원문 그대로 인용하라.
 5. 한국어로 답하라.
 6. 핵심만 간결하게 3~5문장 이내로 답하라. 불필요한 배경 설명이나 서론은 생략한다.
+7. "발표용", "기술적 관점", "사업성 관점", "쉽게 설명", "간단히" 등 형식·관점 지시가 포함된 경우,
+   문서 내용을 그 형식에 맞게 재구성하여 답하라. 이는 내용 검색이 아니라 형식 변환 요청이다.
 """
 
 # 일반 대화용 — 관련 청크가 없을 때 사용
@@ -143,16 +145,25 @@ def handle_meta_query(ctx: QueryContext) -> RagResult:
 
         file_counts: dict[str, int] = {}
         for m in metadatas:
-            f = (m or {}).get("source_file", "알 수 없음")
+            _m = m or {}
+            f = _m.get("source_file") or _m.get("file_name", "알 수 없음")
             file_counts[f] = file_counts.get(f, 0) + 1
 
         total_chunks = col.count()
-        lines = [f"현재 {len(file_counts)}개 문서가 등록되어 있습니다.\n"]
-        for i, fname in enumerate(sorted(file_counts.keys()), 1):
-            lines.append(f"{i}. {fname}")
+        count_only_keywords = ("갯수만", "개수만", "몇 개만", "몇개만", "숫자만", "수만 알")
+        query_lower = ctx.original_query.lower()
+        is_count_only = any(kw in query_lower for kw in count_only_keywords)
+
+        if is_count_only:
+            answer = f"현재 {len(file_counts)}개 문서가 등록되어 있습니다."
+        else:
+            lines = [f"현재 {len(file_counts)}개 문서가 등록되어 있습니다.\n"]
+            for i, fname in enumerate(sorted(file_counts.keys()), 1):
+                lines.append(f"{i}. {fname}")
+            answer = "\n".join(lines)
 
         return RagResult(
-            answer=             "\n".join(lines),
+            answer=             answer,
             citations=          [],
             query_type=         ctx.query_type,
             used_query=         ctx.search_query,
@@ -210,7 +221,8 @@ def handle_existence_query(ctx: QueryContext, req_id: str) -> RagResult:
         files = []
         seen = set()
         for meta, _ in passed:
-            f = (meta or {}).get("source_file", "")
+            _m = meta or {}
+            f = _m.get("source_file") or _m.get("file_name", "")
             if f and f not in seen:
                 seen.add(f)
                 files.append(f)
@@ -265,13 +277,15 @@ def retrieve(
     chunks = []
     for i, chunk_id in enumerate(ids):
         meta = metadatas[i] if i < len(metadatas) else {}
+        _m = meta or {}
+        page = _m.get("page_number")
         chunks.append({
             "chunk_id":    chunk_id,
             "text":        documents[i] if i < len(documents) else "",
             "metadata":    meta,
             "distance":    distances[i] if i < len(distances) else None,
-            "header":      (meta or {}).get("header", ""),
-            "source_file": (meta or {}).get("source_file", ""),
+            "header":      _m.get("header") or (f"p.{page}" if page is not None else ""),
+            "source_file": _m.get("source_file") or _m.get("file_name", ""),
         })
 
     logger.info("[%s] retrieve 완료: %d개 청크 반환", req_id, len(chunks))
@@ -341,6 +355,8 @@ def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
     client = get_client()
     last_exc: Exception | None = None
 
+    import time as _time
+
     for attempt in range(max_retries):
         try:
             resp = client.models.generate_content(
@@ -363,7 +379,12 @@ def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
             if is_rate_limit:
                 logger.error("[%s] Gemini rate limit 초과 → 즉시 종료: %s", req_id, e)
                 raise
-            raise
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s
+                logger.warning("[%s] LLM 호출 실패 (%d/%d), %d초 후 재시도: %s", req_id, attempt + 1, max_retries, wait, e)
+                _time.sleep(wait)
+            else:
+                raise
 
     raise last_exc  # type: ignore[misc]
 
@@ -538,60 +559,3 @@ def ask(
         return handle_existence_query(ctx, req_id)
     return _handle_content(ctx, req_id, filters, chat_history)
 
-
-# =============================================================================
-# CLI — 단독 실행 테스트
-# =============================================================================
-def _print_result(result: RagResult) -> None:
-    print("\n" + "=" * 60)
-    print(f"[query_type: {result.query_type}]")
-    if result.fallback:
-        print(f"[FALLBACK: {result.fallback_reason}]")
-    if result.reformulated_query:
-        print(f"[Reformulation] {result.reformulated_query}")
-    if result.understood_query:
-        print(f"[Understanding] {result.understood_query}")
-    print(f"\n[답변]\n{result.answer}")
-    print(f"\n[검색 통계]")
-    print(f"  사용된 query:    {result.used_query}")
-    print(f"  검색된 청크:     {result.retrieved_count}개")
-    print(f"  threshold 통과:  {result.passed_threshold}개")
-    if result.top_distance is not None:
-        print(f"  최근접 distance: {result.top_distance:.4f}")
-    if result.citations:
-        print("\n[출처]")
-        for c in result.citations:
-            dist = f" (dist={c.distance:.4f})" if c.distance is not None else ""
-            print(f"  - {c.header} | {c.source_file}{dist}")
-    print("=" * 60)
-
-
-_TEST_CASES = [
-    ("메타 질문",               "파일 몇 개 들어있어?"),
-    ("메타 질문",               "어떤 문서들 있어?"),
-    ("존재 확인",               "에너지 관련 특허 있어?"),
-    ("존재 확인",               "RAG 관련 자료 있나요?"),
-    ("문서에 있는 질문",         "건물 에너지 모델링 자동화 시스템은 무엇이야?"),
-    ("수치/날짜 질문",           "건물 에너지 모델링 자동화 시스템 특허의 출원일은 언제야?"),
-    ("구어체 질문",             "출원일 알려줘"),
-    ("문서에 없는 질문",         "직원 복지 정책이 나와있어?"),
-    ("일반 대화 — 날씨",        "서울날씨 알려줘"),
-    ("일반 대화 — 인사",        "ㅎㅇ"),
-    ("일반 대화 — 추천",        "오늘 점심 뭐 먹을까"),
-]
-
-
-if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        for label, q in _TEST_CASES:
-            print(f"\n{'#' * 60}")
-            print(f"[케이스] {label}")
-            print(f"[질문]   {q}")
-            _print_result(ask(q))
-    else:
-        q = sys.argv[1] if len(sys.argv) > 1 else "회사 주요 특허는 무엇인가요?"
-        print(f"\n질문: {q}")
-        _print_result(ask(q))

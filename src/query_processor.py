@@ -267,8 +267,10 @@ def process_query(
 
     search_query = understood if understood else base_query
 
-    # 4. routing
-    query_type = classify_query(search_query)
+    # 4. routing — base_query 기준으로 분류 (understanding 이전)
+    # understanding이 "있나/있어" 같은 존재 확인 키워드를 제거할 수 있으므로
+    # search_query로 분류하면 existence → content 오분류가 발생한다.
+    query_type = classify_query(base_query)
 
     return QueryContext(
         original_query=query,
