@@ -106,6 +106,13 @@ _EXISTENCE_PATTERN = re.compile(
     r"|.{1,20}(특허|자료|문서|파일)\s*(있어|있나|있나요)\??"
 )
 
+# routing — 토픽 필터 목록 질문: "에너지 관련 파일 뭐있어" 같이
+# meta 패턴에도 걸리지만 실제로는 토픽 필터 검색이어야 하는 쿼리
+# meta보다 먼저 체크해서 existence로 라우팅한다.
+_TOPIC_LIST_PATTERN = re.compile(
+    r".{1,15}(관련|관한)\s*.{0,5}(파일|문서)\s*(뭐|무엇|어떤|몇)"
+)
+
 
 # =============================================================================
 # Step 0 — history trim
@@ -220,6 +227,11 @@ def classify_query(query: str) -> QueryType:
       라우팅은 단순 분류라 LLM이 필요없다.
       LLM 호출 시 매 질문마다 추가 지연/비용이 발생한다.
     """
+    # "에너지 관련 파일 뭐있어" 같이 토픽 수식어가 붙은 목록 질문은
+    # meta 패턴보다 먼저 잡아 existence로 라우팅한다.
+    # meta는 전체 목록 반환이라 토픽 필터가 무시되기 때문.
+    if _TOPIC_LIST_PATTERN.search(query):
+        return "existence"
     if _META_PATTERN.search(query):
         return "meta"
     if _EXISTENCE_PATTERN.search(query):
