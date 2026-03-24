@@ -36,7 +36,7 @@ PROCESSOR_CONFIG = {
 # =============================================================================
 # 출력 타입
 # =============================================================================
-QueryType = Literal["meta", "existence", "content"]
+QueryType = Literal["meta", "existence", "content", "greeting"]
 
 
 class QueryContext(BaseModel):
@@ -91,6 +91,12 @@ _COLLOQUIAL_PATTERN = re.compile(
     r"알려줘|알려주세요|뭐야|뭐지|어때|있어|있나|있나요|해줘|가르쳐|얼마야|언제야|어디야|뭐가|어떻게"
 )
 
+# routing — greeting: 인사·잡담 (벡터 검색 없이 바로 chitchat으로)
+_GREETING_PATTERN = re.compile(
+    r"^(안녕|하이|헬로|ㅎㅇ|hi|hello|hey|반가워|반갑|고마워|감사|ㄱㅅ|ㅊㅋ|축하|잘있어|잘가|bye|굿모닝|좋은\s*아침|뭐해|뭐하고있어|심심|놀자)\s*[~!?ㅎㅋ]*$",
+    re.IGNORECASE,
+)
+
 # routing — meta: DB 전체 현황을 묻는 질문
 _META_PATTERN = re.compile(
     r"(파일|문서).{0,6}(몇\s*개|갯수|개수|목록|리스트|뭐|무엇|어떤)"
@@ -102,8 +108,8 @@ _META_PATTERN = re.compile(
 
 # routing — existence: 특정 주제 자료 존재 여부를 묻는 질문
 _EXISTENCE_PATTERN = re.compile(
-    r".{1,20}(관련|관한)\s*(특허|자료|문서|파일)?\s*(있어|있나|있나요|있습니까)\??"
-    r"|.{1,20}(특허|자료|문서|파일)\s*(있어|있나|있나요)\??"
+    r".{1,20}(관련|관한)\s*(특허|자료|문서|파일)?[가은는이]?\s*(있어|있나|있나요|있습니까)\??"
+    r"|.{1,20}(특허|자료|문서|파일)[가은는이]?\s*(있어|있나|있나요)\??"
 )
 
 # routing — 토픽 필터 목록 질문: "에너지 관련 파일 뭐있어" 같이
@@ -227,6 +233,10 @@ def classify_query(query: str) -> QueryType:
       라우팅은 단순 분류라 LLM이 필요없다.
       LLM 호출 시 매 질문마다 추가 지연/비용이 발생한다.
     """
+    # 인사·잡담은 가장 먼저 잡아 벡터 검색 없이 바로 chitchat으로 보낸다.
+    # understanding이 "하이"를 기술 용어로 오해하는 오분류도 방지한다.
+    if _GREETING_PATTERN.match(query.strip()):
+        return "greeting"
     # "에너지 관련 파일 뭐있어" 같이 토픽 수식어가 붙은 목록 질문은
     # meta 패턴보다 먼저 잡아 existence로 라우팅한다.
     # meta는 전체 목록 반환이라 토픽 필터가 무시되기 때문.
@@ -270,19 +280,19 @@ def process_query(
 
     base_query = reformulated if reformulated else query
 
-    # 3. understanding (조건부)
+    # 3. routing — understanding 전에 먼저 분류
+    # meta/existence는 understanding을 스킵해 LLM 호출을 줄인다.
+    # understanding 이후 분류하면 "있어/있나" 키워드가 제거돼 오분류 위험도 있음.
+    query_type = classify_query(base_query)
+
+    # 4. understanding (content만 실행)
     understood: str | None = None
-    if should_understand(base_query):
+    if query_type == "content" and should_understand(base_query):
         result = understand_query(base_query, req_id)
         if result != base_query:
             understood = result
 
     search_query = understood if understood else base_query
-
-    # 4. routing — base_query 기준으로 분류 (understanding 이전)
-    # understanding이 "있나/있어" 같은 존재 확인 키워드를 제거할 수 있으므로
-    # search_query로 분류하면 existence → content 오분류가 발생한다.
-    query_type = classify_query(base_query)
 
     return QueryContext(
         original_query=query,

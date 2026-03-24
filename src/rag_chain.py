@@ -553,6 +553,8 @@ def ask(
         ctx.search_query,
     )
 
+    if ctx.query_type == "greeting":
+        return _handle_chitchat(ctx, req_id, chat_history, retrieved_count=0, top_distance=None)
     if ctx.query_type == "meta":
         return handle_meta_query(ctx)
     if ctx.query_type == "existence":

@@ -9,15 +9,21 @@ import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from src.pdf_parser import parse_single_pdf
 from src.rag_chain import RAG_CONFIG, RagResult, ask
 from src.summary_service import get_summaries
-from src.vector_db import get_or_create_collection
+from src.vector_db import get_or_create_collection, upsert_chunks_to_chroma
 
 load_dotenv()
 
@@ -163,6 +169,134 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")
 
     return result
+
+
+# =============================================================================
+# Drive 연동 엔드포인트 (AutoDraft_ingest → AutoDraft_clean)
+# =============================================================================
+@app.post("/ingest")
+async def ingest(
+    file: UploadFile = File(...),
+    file_id: str = Form(...),
+    file_name: str = Form(...),
+):
+    """
+    AutoDraft_ingest 서비스에서 Drive 파일을 전달받아
+    파싱 → 청킹 → ChromaDB 적재까지 수행한다.
+    같은 file_id로 재전송 시 기존 청크를 덮어쓴다 (멱등성).
+    """
+    logger.info("POST /ingest | file_id=%s | file_name=%s", file_id, file_name)
+
+    raw_bytes = await file.read()
+
+    project_root = Path(__file__).resolve().parent.parent
+    input_dir = project_root / "data" / "raw" / "company" / "drive"
+    output_root = project_root / "data" / "processed" / "parsing_result_company"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    pdf_path = input_dir / file_name
+    pdf_path.write_bytes(raw_bytes)
+
+    try:
+        chunks = await parse_single_pdf(
+            source_pdf=pdf_path,
+            input_dir=input_dir,
+            output_root=output_root,
+        )
+    except Exception as e:
+        logger.error("파싱 실패: %s | %s", file_name, e)
+        raise HTTPException(status_code=500, detail=f"파싱 실패: {e}")
+
+    # file_id를 각 청크 메타데이터에 추가 (삭제 시 필터링 기준)
+    for chunk in chunks:
+        chunk.setdefault("metadata", {})["file_id"] = file_id
+
+    # 기존 청크 삭제 후 upsert (재처리 시 중복 방지)
+    col = get_or_create_collection(
+        persist_dir=RAG_CONFIG["persist_dir"],
+        collection_name=RAG_CONFIG["collection_name"],
+        embedding_provider=RAG_CONFIG["embedding_provider"],
+    )
+    try:
+        col.delete(where={"file_id": file_id})
+    except Exception:
+        pass  # 기존 청크 없으면 무시
+
+    upsert_chunks_to_chroma(
+        chunks=chunks,
+        collection_name=RAG_CONFIG["collection_name"],
+        persist_dir=RAG_CONFIG["persist_dir"],
+        embedding_provider=RAG_CONFIG["embedding_provider"],
+        default_doc_type="company",
+    )
+
+    # ChromaDB 적재 완료 후 raw PDF 삭제.
+    # 원본은 Drive에 있으므로 재처리 필요 시 다시 다운로드하면 된다.
+    pdf_path.unlink(missing_ok=True)
+
+    logger.info("적재 완료: file_id=%s | chunks=%d", file_id, len(chunks))
+    return {"chunk_count": len(chunks), "file_id": file_id, "file_name": file_name}
+
+
+class RenameRequest(BaseModel):
+    file_name: str = Field(min_length=1)
+
+
+@app.patch("/ingest/{file_id}")
+def rename_ingest(file_id: str, req: RenameRequest):
+    """
+    Drive에서 파일 제목만 변경된 경우 ChromaDB 메타데이터의 source_file만 업데이트한다.
+    재파싱/재임베딩 없이 파일명만 교체하므로 API 비용이 발생하지 않는다.
+    """
+    logger.info("PATCH /ingest/%s | new_name=%s", file_id, req.file_name)
+    try:
+        col = get_or_create_collection(
+            persist_dir=RAG_CONFIG["persist_dir"],
+            collection_name=RAG_CONFIG["collection_name"],
+            embedding_provider=RAG_CONFIG["embedding_provider"],
+        )
+        result = col.get(where={"file_id": file_id}, include=["metadatas"])
+        ids = result["ids"]
+
+        if not ids:
+            raise HTTPException(status_code=404, detail=f"file_id={file_id}에 해당하는 청크 없음")
+
+        updated_metadatas = []
+        for meta in result["metadatas"]:
+            updated_meta = dict(meta)
+            updated_meta["source_file"] = req.file_name
+            updated_metadatas.append(updated_meta)
+
+        col.update(ids=ids, metadatas=updated_metadatas)
+        logger.info("메타데이터 업데이트 완료: file_id=%s | chunks=%d", file_id, len(ids))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("메타데이터 업데이트 실패: %s | %s", file_id, e)
+        raise HTTPException(status_code=500, detail=f"메타데이터 업데이트 실패: {e}")
+
+    return {"updated_chunks": len(ids), "file_id": file_id, "file_name": req.file_name}
+
+
+@app.delete("/ingest/{file_id}")
+def delete_ingest(file_id: str):
+    """
+    Drive에서 파일이 삭제됐을 때 ChromaDB에서 해당 파일의 청크를 제거한다.
+    """
+    logger.info("DELETE /ingest/%s", file_id)
+    try:
+        col = get_or_create_collection(
+            persist_dir=RAG_CONFIG["persist_dir"],
+            collection_name=RAG_CONFIG["collection_name"],
+            embedding_provider=RAG_CONFIG["embedding_provider"],
+        )
+        col.delete(where={"file_id": file_id})
+    except Exception as e:
+        logger.error("청크 삭제 실패: %s | %s", file_id, e)
+        raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
+
+    return {"deleted": True, "file_id": file_id}
 
 
 # =============================================================================
