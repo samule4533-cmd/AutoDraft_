@@ -61,9 +61,15 @@ SAVE_PARSE_REPORT = True
 SAVE_FIELDS_JSON = True
 SAVE_VECTOR_CHUNKS = True
 
-# RAG 파이프라인 최적화를 위한 파싱 프롬프트
-# 한국어 기업문서(특허/인증/회사소개) 특화 지침 포함
-PDF_PARSE_PROMPT = """
+# =============================================================================
+# 파싱 프롬프트 (모듈형)
+# - _BASE_PARSE_PROMPT  : 문서 유형에 무관한 공통 지침
+# - _PATENT_RULES       : 특허 문서 전용 구조화 지침
+# - _CERT_RULES         : 인증서 문서 전용 구조화 지침 (향후 확장용)
+# - _COMPANY_RULES      : 회사소개/실적자료 전용 구조화 지침 (향후 확장용)
+# - build_parse_prompt() : doc_type에 따라 프롬프트를 조합하여 반환
+# =============================================================================
+_BASE_PARSE_PROMPT = """
 너는 RAG 파이프라인을 위한 최고 수준의 문서 파서야.
 첨부된 PDF 문서를 읽고 레이아웃이 최대한 보존된 Markdown 형식으로 변환해줘.
 
@@ -74,20 +80,77 @@ PDF_PARSE_PROMPT = """
 4. 숫자, 날짜, 등록번호, 특허번호, 인증번호, 기관명, 회사명, 제품명, 기술명, 문의처 등은 원문에 가깝게 보존할 것.
 5. 본문 내 강조(**bold**), 목록, 표제어, 도면명, 도표 설명, 붙임 제목 등은 가능한 한 유지할 것.
 6. 읽기 애매한 부분은 임의로 자연스럽게 바꾸지 말고 원문에 가깝게 남길 것.
-7. 페이지 구분선(---, ===, ─── 등 구분 역할의 선)은 제거할 것. 페이지 번호는 `[p.N]` 형식으로 단독 줄에 통일하여 보존할 것 (예: `[p.3]`). 단, 특허 번호·등록번호·인증번호처럼 본문 내용에 해당하는 번호는 절대 건드리지 말 것.
+7. 페이지 구분선(---, ===, ─── 등 구분 역할의 선)은 완전히 제거할 것. 헤더 바로 아래에도 구분선을 넣지 말 것.
+   페이지 번호는 `[p.N]` 형식으로 단독 줄에 통일하여 보존할 것 (예: `[p.3]`).
+   단, 특허 번호·등록번호·인증번호처럼 본문 내용에 해당하는 번호는 절대 건드리지 말 것.
 
-[회사 자료 특화 지침]
-8. 문서가 특허, 인증서, 회사소개서, 실적자료, 제안서, 기술소개서, 브로슈어 중 무엇에 가까운지 구조를 유지하며 파싱할 것.
-9. 특허 문서의 경우 발명의 명칭, 기술분야, 배경기술, 해결과제, 해결수단, 효과, 청구항, 도면 설명을 특히 정확히 보존할 것.
-10. 인증 문서의 경우 인증명, 인증기관, 인증번호, 등록일, 유효기간, 대상, 범위를 정확히 보존할 것.
-11. 회사소개/실적 자료의 경우 사업 개요, 주요 기술, 제품/서비스 설명, 프로젝트명, 발주처, 기간, 성과, 수치 정보, 표와 목록을 정확히 보존할 것.
-12. 목차가 있으면 목차 구조를 유지하고, 본문 섹션 제목이 분명하면 Markdown 헤더로 승격할 것.
-13. 문서 검색과 질의응답에 도움이 되도록, 의미 있는 제목/소제목/섹션 구분이 사라지지 않게 할 것.
-14. "중략", "생략", "요약", "...", "등" 등의 축약 표현을 임의로 삽입하지 말 것.
-15. 응답은 문서에서 확인되는 내용을 처음부터 끝까지 순서대로 충실히 옮길 것.
-
-출력은 설명 없이 Markdown 본문만 반환할 것.
+[공통 구조화 지침]
+8. 헤더(#, ##, ###)는 실질적인 내용(본문 2줄 이상)이 뒤따르는 섹션에만 붙일 것.
+   단일 줄 값, 짧은 레이블, 번호 하나만 있는 항목에는 헤더를 붙이지 말 것.
+9. "중략", "생략", "요약", "...", "등" 등의 축약 표현을 임의로 삽입하지 말 것.
+10. 응답은 문서에서 확인되는 내용을 처음부터 끝까지 순서대로 충실히 옮길 것.
 """.strip()
+
+_PATENT_RULES = """
+[특허 문서 구조화 지침]
+11. 특허 서지정보 항목 [(19) 국가, (21) 출원번호, (22) 출원일, (24) 등록일, (45) 공고일,
+    (51) IPC, (54) 발명의 명칭, (57) 요약, (71) 출원인, (72) 발명자, (73) 특허권자,
+    (74) 대리인 등 번호로 시작하는 메타데이터 필드]는 각각을 별도 헤더(##)로 쪼개지 말 것.
+    → "## 특허 서지정보" 하나의 섹션 안에 "- 항목명: 값" 목록으로 묶을 것.
+    예시:
+    ## 특허 서지정보
+    - 등록번호: 10-2708831
+    - 공고일자: 2024년 09월 24일
+    - 등록일자: 2024년 09월 19일
+    - 출원번호: 10-2023-0170792
+    - 출원인: 주식회사 나인와트
+    - 발명자: 홍길동
+    - 대리인: 이미래특허법률사무소
+
+12. 단독 등록번호·특허번호·출원번호처럼 값만 있는 한 줄짜리는 반드시 서지정보 섹션이나
+    선행기술 섹션 등 가장 관련 있는 섹션의 내용으로 포함시킬 것.
+    독립 헤더나 독립 단락으로 분리하지 말 것.
+
+13. 발명의 명칭, 기술분야, 배경기술, 해결과제, 해결수단, 효과, 청구항, 도면 설명은 각각
+    별도 섹션(##)으로 분리하여 정확히 보존할 것.
+""".strip()
+
+_CERT_RULES = """
+[인증서 문서 구조화 지침]
+11. 인증명, 인증기관, 인증번호, 등록일, 유효기간, 인증 범위 등 메타 항목은
+    "## 인증 서지정보" 하나의 섹션 안에 "- 항목명: 값" 목록으로 묶을 것.
+12. 인증 범위·조건·세부 내역은 별도 섹션으로 분리하여 보존할 것.
+""".strip()
+
+_COMPANY_RULES = """
+[회사소개/실적 문서 구조화 지침]
+11. 사업 개요, 주요 기술, 제품/서비스 설명, 프로젝트명, 발주처, 기간, 성과, 수치 정보,
+    표와 목록을 정확히 보존할 것.
+12. 목차가 있으면 목차 구조를 유지하고, 본문 섹션 제목이 분명하면 Markdown 헤더로 승격할 것.
+""".strip()
+
+_OUTPUT_INSTRUCTION = "\n\n출력은 설명 없이 Markdown 본문만 반환할 것."
+
+_DOC_TYPE_RULES = {
+    "patent":  _PATENT_RULES,
+    "cert":    _CERT_RULES,
+    "company": _COMPANY_RULES,
+}
+
+
+def build_parse_prompt(doc_type: str = "company") -> str:
+    """
+    doc_type에 맞는 파싱 프롬프트를 조합하여 반환.
+    지원 doc_type: "patent" | "cert" | "company"
+    알 수 없는 타입은 company 규칙으로 fallback.
+    """
+    type_rules = _DOC_TYPE_RULES.get(doc_type, _COMPANY_RULES)
+    return _BASE_PARSE_PROMPT + "\n\n" + type_rules + _OUTPUT_INSTRUCTION
+
+
+# 단독 실행 / 기본값용 — doc_type은 .env의 DOC_SOURCE_TYPE에서 결정
+# 특허(patent) 문서가 대부분이면 "patent"로 지정
+PDF_PARSE_PROMPT = build_parse_prompt(doc_type="patent")
 
 
 # =============================================================================
@@ -200,7 +263,7 @@ def _upload_and_wait(client: genai.Client, file_path: Path):
         return uploaded
 
 
-async def parse_pdf_to_markdown(source_pdf: Path) -> str:
+async def parse_pdf_to_markdown(source_pdf: Path, parse_prompt: str = PDF_PARSE_PROMPT) -> str:
     """PDF를 Gemini File API에 업로드하고 Markdown 텍스트로 변환하여 반환"""
     client = get_genai_client()
 
@@ -209,7 +272,7 @@ async def parse_pdf_to_markdown(source_pdf: Path) -> str:
     logger.info("Gemini 호출 시작: model=%s, file=%s", GEMINI_PDF_MODEL, source_pdf.name)
     response = await client.aio.models.generate_content(
         model=GEMINI_PDF_MODEL,
-        contents=[uploaded_file, PDF_PARSE_PROMPT],
+        contents=[uploaded_file, parse_prompt],
         config=types.GenerateContentConfig(
             temperature=0.0,                         # 재현성을 위해 temperature 0
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
@@ -228,6 +291,7 @@ async def parse_single_pdf(
     source_pdf: Path,
     input_dir: Path,
     output_root: Path,
+    doc_type: str = "patent",
 ) -> List[Dict[str, Any]]:
     """
     PDF 1개를 파싱하고 디스크에 저장한 뒤 청크 목록을 반환.
@@ -254,7 +318,7 @@ async def parse_single_pdf(
     t0 = time.perf_counter()
 
     # Gemini File API로 PDF → Markdown 변환
-    markdown_text = await parse_pdf_to_markdown(source_pdf)
+    markdown_text = await parse_pdf_to_markdown(source_pdf, parse_prompt=build_parse_prompt(doc_type))
 
     # 볼드 전체줄을 헤더로 보정 (Gemini 출력 정규화)
     markdown_text = normalize_markdown_headings(markdown_text)

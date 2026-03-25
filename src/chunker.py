@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Tuple
 # Config
 # =============================================================================
 CHUNKER_CONFIG = {
-    "section_max_len": 1500,   # 이 길이 이하 섹션은 1개 청크로 유지
-    "group_max_len":   1300,   # 긴 섹션을 문단 그룹으로 나눌 때 최대 길이
+    "section_max_len":       1500,  # 이 길이 이하 섹션은 1개 청크로 유지
+    "group_max_len":         1300,  # 긴 섹션을 문단 그룹으로 나눌 때 최대 길이
+    "min_chunk_content_len":   80,  # 헤더 제외 실질 본문이 이 길이 미만이면 청크 생성 안 함
+                                    # (구분자·헤더만 있는 쓸모없는 청크 방지)
 }
 
 
@@ -134,6 +136,7 @@ def split_markdown_into_chunks(
     source_type: str = "gemini_file_api_markdown",
     section_max_len: int = CHUNKER_CONFIG["section_max_len"],
     group_max_len: int = CHUNKER_CONFIG["group_max_len"],
+    min_chunk_content_len: int = CHUNKER_CONFIG["min_chunk_content_len"],
 ) -> List[Dict[str, Any]]:
     """
     RAG용 chunking:
@@ -158,27 +161,32 @@ def split_markdown_into_chunks(
     def flush_section() -> None:
         nonlocal current_lines, current_header
         body = "\n".join(current_lines).strip()
-        if body:
-            # 헤더 라인(# 으로 시작)을 제외한 실제 내용이 있는지 확인한다.
-            #
-            # 문제 상황:
-            #   PDF에서 변환된 Markdown에 헤더만 있고 내용이 없는 섹션이 존재한다.
-            #   예: "## 출원일자" 다음에 바로 다른 헤더가 오는 경우.
-            #
-            # 기존 코드에서 발생하는 문제:
-            #   current_lines에 헤더 라인 자체도 포함되어 있어서
-            #   body = "## 출원일자" 만으로도 if body 조건을 통과한다.
-            #   이 청크가 벡터 DB에 들어가면 "출원일자" 관련 질문에 매칭되지만
-            #   LLM에 전달되는 내용은 헤더 한 줄뿐이라 환각의 원인이 된다.
-            #
-            # [주의] 이 수정 후 최초 1회 벡터 DB 재적재가 필요하다.
-            #   기존에 이미 적재된 헤더 전용 청크는 이 필터로 걸러지지 않는다.
-            content_lines = [
-                l for l in body.splitlines()
-                if not re.match(r"^\s*#{1,6}\s+", l)
-            ]
-            if "\n".join(content_lines).strip():
-                sections.append({"header": current_header, "text": body})
+        if not body:
+            current_lines = []
+            return
+
+        # [필터 1] 헤더 라인(# 으로 시작) 제외 → 실제 본문만 추출
+        content_lines = [
+            l for l in body.splitlines()
+            if not re.match(r"^\s*#{1,6}\s+", l)
+        ]
+
+        # [필터 2] 구분자만 있는 줄(---, ===, ___ 등) 제거
+        # Gemini가 프롬프트 지침을 완벽히 따르지 않아 구분자가 남는 경우 방어.
+        # 페이지 구분선이 독립 섹션으로 잘려도 청크가 되지 않도록 차단.
+        meaningful_lines = [
+            l for l in content_lines
+            if l.strip() and not re.match(r"^[-=_*]{2,}\s*$", l.strip())
+        ]
+        content_text = "\n".join(meaningful_lines).strip()
+
+        # [필터 3] 실질 본문이 min_chunk_content_len 미만이면 청크로 만들지 않음
+        # 특허 메타 한 줄짜리("발명자: 홍길동"), 빈 섹션 헤더 등이 청크가 되어
+        # 벡터 임베딩이 약해지고 reranker 판단 근거가 없어지는 문제 방지.
+        # 프롬프트 수정 후에도 Gemini 출력 변동성으로 발생할 수 있는 짧은 청크의 안전망.
+        if content_text and len(content_text) >= min_chunk_content_len:
+            sections.append({"header": current_header, "text": body})
+
         current_lines = []
 
     for line in lines:

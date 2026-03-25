@@ -20,6 +20,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import src.bm25_retriever as bm25_retriever
+# import src.reranker as reranker  # GPU 서버 구축 후 활성화
 from src.pdf_parser import parse_single_pdf
 from src.rag_chain import RAG_CONFIG, RagResult, ask
 from src.summary_service import get_summaries
@@ -27,8 +29,6 @@ from src.vector_db import get_or_create_collection, upsert_chunks_to_chroma
 
 load_dotenv()
 
-# uvicorn CLI로 실행할 때도 로그가 보이도록 모듈 로딩 시점에 설정한다.
-# if __name__ == "__main__" 안에 두면 python api.py 직접 실행 시에만 적용된다.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -39,26 +39,33 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Lifespan — 서버 시작/종료 이벤트
 # =============================================================================
-# FastAPI 권장 방식: @app.on_event 대신 lifespan 컨텍스트 매니저 사용.
-# yield 이전 = 시작 시 실행 / yield 이후 = 종료 시 실행.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 서버 시작 시 임베딩 모델과 ChromaDB 클라이언트를 미리 로딩한다.
-    # 첫 요청 시 로딩하면 SentenceTransformer 모델 로딩으로 수 초 지연이 발생한다.
-    # 여기서 미리 호출하면 get_or_create_collection() 내부에서
-    # ChromaDB 클라이언트(_chroma_client_cache)와 임베딩 함수가 초기화된다.
     logger.info("warm-up 시작: ChromaDB 클라이언트 + 임베딩 모델 로딩")
     try:
-        get_or_create_collection(
+        col = get_or_create_collection(
             persist_dir=RAG_CONFIG["persist_dir"],
             collection_name=RAG_CONFIG["collection_name"],
             embedding_provider=RAG_CONFIG["embedding_provider"],
         )
-        logger.info("warm-up 완료")
+        logger.info("warm-up 완료: ChromaDB")
     except Exception as e:
-        # 데이터가 아직 적재되지 않은 환경에서도 서버는 뜰 수 있어야 한다.
-        # 오류를 로그로 남기고 서버 구동은 계속 진행한다.
-        logger.warning("warm-up 실패 (서버는 계속 실행됨): %s", e)
+        col = None
+        logger.warning("ChromaDB warm-up 실패 (서버는 계속 실행됨): %s", e)
+
+    # BM25 인덱스 빌드 — ChromaDB 청크 전체를 읽어 인메모리 인덱스 생성
+    if col is not None:
+        try:
+            bm25_retriever.build_index(col)
+        except Exception as e:
+            logger.warning("BM25 인덱스 빌드 실패 (서버는 계속 실행됨): %s", e)
+
+    # jina reranker 모델 로드 (~280MB, 최초 실행 시 HuggingFace에서 다운로드)
+    # try:
+    #     reranker.load_model()
+    # except Exception as e:
+    #     logger.warning("reranker 모델 로드 실패 (서버는 계속 실행됨): %s", e)
+
     yield
     logger.info("서버 종료")
 
@@ -89,23 +96,13 @@ app.add_middleware(
 # 입력 스키마
 # =============================================================================
 class ChatMessage(BaseModel):
-    # role은 "user" 또는 "assistant"만 허용.
-    # 그 외 값이 들어오면 FastAPI가 422 Unprocessable Entity를 자동 반환한다.
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1)
 
 
 class ChatRequest(BaseModel):
-    # min_length=1: 빈 문자열 차단 (환각 유발 방지)
-    # max_length=1000: 지나치게 긴 입력이 reformulation + retrieve 두 번의 LLM 호출을 유발하는 것을 방어
     query: str = Field(min_length=1, max_length=1000)
-
-    # chat_history: 이전 대화 맥락. 없으면 단발성 질문으로 처리.
-    # list 자체도 None 허용이므로 채팅 첫 시작 시 생략 가능하다.
     chat_history: list[ChatMessage] | None = None
-
-    # filters: ChromaDB where 조건. Phase 3 메타데이터 필터링용.
-    # 지금은 None으로 두면 되고, 나중에 {"doc_type": "company"} 형태로 확장한다.
     filters: dict | None = None
 
 
@@ -117,7 +114,6 @@ def health():
     """
     서버 상태 확인용 엔드포인트.
     ChromaDB 컬렉션 접근 가능 여부와 적재된 청크 수를 반환한다.
-    배포 후 서버가 실제로 쿼리를 처리할 준비가 됐는지 즉시 확인할 수 있다.
     """
     try:
         col = get_or_create_collection(
@@ -131,7 +127,6 @@ def health():
             "chunk_count": col.count(),
         }
     except Exception as e:
-        # 503: 서버는 살아있지만 DB에 접근할 수 없는 상태
         raise HTTPException(status_code=503, detail=f"ChromaDB 접근 실패: {e}")
 
 
@@ -141,30 +136,18 @@ def chat(req: ChatRequest):
     사용자 질문을 받아 RAG 답변을 반환한다.
     chat_history가 있으면 이전 대화 맥락을 반영하고,
     지시어가 포함된 질문은 자동으로 reformulation을 시도한다.
-
-    응답의 fallback 필드가 True이면 정상 답변이 아님을 의미한다.
-    fallback_reason으로 원인을 구분할 수 있다:
-      - "no_docs": threshold를 통과한 관련 문서 없음
-      - "retrieval_error": ChromaDB 검색 실패
-      - "llm_error": Gemini 호출 실패
     """
-    # API 진입점 로그: 어떤 요청이 들어왔는지 기록한다.
-    # query는 앞 60자만 출력 (긴 질문이 로그를 도배하지 않도록)
     logger.info(
         "POST /chat | query=%.60s | history_len=%d",
         req.query,
         len(req.chat_history or []),
     )
 
-    # Pydantic 모델 → dict 변환.
-    # ask()는 내부에서 m.get("role"), m.get("content")로 dict에 접근하므로 변환이 필요하다.
     history = [m.model_dump() for m in req.chat_history] if req.chat_history else None
 
     try:
         result = ask(query=req.query, chat_history=history, filters=req.filters)
     except Exception as e:
-        # ask() 내부에서 이미 fallback 처리를 하므로 여기까지 오는 경우는 드물다.
-        # 예상치 못한 예외가 발생했을 때 500으로 반환한다.
         logger.error("ask() 예외: %s", e)
         raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")
 
@@ -203,6 +186,7 @@ async def ingest(
             source_pdf=pdf_path,
             input_dir=input_dir,
             output_root=output_root,
+            doc_type="patent",
         )
     except Exception as e:
         logger.error("파싱 실패: %s | %s", file_name, e)
@@ -232,8 +216,13 @@ async def ingest(
     )
 
     # ChromaDB 적재 완료 후 raw PDF 삭제.
-    # 원본은 Drive에 있으므로 재처리 필요 시 다시 다운로드하면 된다.
     pdf_path.unlink(missing_ok=True)
+
+    # BM25 인덱스 재빌드 — 새 청크가 추가됐으므로 인메모리 인덱스를 갱신한다.
+    try:
+        bm25_retriever.rebuild_index(col)
+    except Exception as e:
+        logger.warning("BM25 재빌드 실패 (검색은 이전 인덱스로 동작): %s", e)
 
     logger.info("적재 완료: file_id=%s | chunks=%d", file_id, len(chunks))
     return {"chunk_count": len(chunks), "file_id": file_id, "file_name": file_name}
@@ -276,6 +265,12 @@ def rename_ingest(file_id: str, req: RenameRequest):
         logger.error("메타데이터 업데이트 실패: %s | %s", file_id, e)
         raise HTTPException(status_code=500, detail=f"메타데이터 업데이트 실패: {e}")
 
+    # BM25 재빌드 — _chunks의 source_file 메타데이터를 최신 상태로 갱신
+    try:
+        bm25_retriever.rebuild_index(col)
+    except Exception as e:
+        logger.warning("BM25 재빌드 실패 (이전 인덱스로 동작): %s", e)
+
     return {"updated_chunks": len(ids), "file_id": file_id, "file_name": req.file_name}
 
 
@@ -295,6 +290,17 @@ def delete_ingest(file_id: str):
     except Exception as e:
         logger.error("청크 삭제 실패: %s | %s", file_id, e)
         raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
+
+    # BM25 재빌드 — 삭제된 청크가 검색 결과에 계속 등장하는 것을 방지
+    try:
+        col = get_or_create_collection(
+            persist_dir=RAG_CONFIG["persist_dir"],
+            collection_name=RAG_CONFIG["collection_name"],
+            embedding_provider=RAG_CONFIG["embedding_provider"],
+        )
+        bm25_retriever.rebuild_index(col)
+    except Exception as e:
+        logger.warning("BM25 재빌드 실패 (이전 인덱스로 동작): %s", e)
 
     return {"deleted": True, "file_id": file_id}
 
@@ -329,6 +335,4 @@ def summaries():
 # 직접 실행
 # =============================================================================
 if __name__ == "__main__":
-    # reload=True: 코드 변경 시 서버 자동 재시작 (개발용)
-    # 운영 배포 시 reload=False, workers=N으로 변경한다.
     uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)

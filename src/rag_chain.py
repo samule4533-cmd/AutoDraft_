@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from src.llm_api import GeminiAPIError, get_client
 from src.query_processor import QueryContext, QueryType, process_query, trim_history
 from src.vector_db import get_or_create_collection, query_collection
+import src.bm25_retriever as bm25_retriever
+# import src.reranker as reranker  # GPU 서버 구축 후 활성화
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +32,22 @@ RAG_CONFIG = {
     "persist_dir":        str(PROJECT_ROOT / "data" / "vector_store" / "chroma"),
     "embedding_provider": os.getenv("EMBEDDING_PROVIDER", "local"),
     "gemini_model":       os.getenv("GEMINI_RAG_MODEL", "gemini-2.0-flash"),
-    "n_results":          10,
-    "distance_threshold":           0.55,
-    "existence_distance_threshold": 0.65,
+    # ── hybrid 검색 설정 ──────────────────────────────────────────────────────
+    "bm25_top_k":         10,    # BM25에서 가져올 후보 수
+    "vector_top_k":       10,    # 벡터 검색에서 가져올 후보 수
+    "rrf_top_n":           10,    # RRF 후 LLM에 전달할 최종 청크 수
+    "rrf_k":              60,    # RRF 상수. 표준값 60. 낮추면 상위 랭크 boost 강해짐
+    # ── 품질 게이트 ───────────────────────────────────────────────────────────
+    # 벡터 검색 결과의 최솟값(best_distance)이 이 값 초과면 관련 문서 없음으로 판단.
+    # reranker 활성화 시: min_rerank_score(0.1) 기반 게이트로 교체 가능.
+    "distance_threshold": 0.65,
     "max_context_chars":  6000,
 }
 
-# fallback 메시지 (에러 상황 전용)
+# 응답 메시지 상수
 _MSG_RETRIEVAL_ERROR = "문서 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
 _MSG_LLM_ERROR       = "답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+_MSG_NO_DOCS         = "사내 문서에서 해당 내용을 찾을 수 없습니다."
 
 # 사내 문서 RAG 답변용 — 관련 청크가 있을 때 사용
 SYSTEM_PROMPT = """\
@@ -60,20 +69,11 @@ SYSTEM_PROMPT = """\
    문서 내용을 그 형식에 맞게 재구성하여 답하라. 이는 내용 검색이 아니라 형식 변환 요청이다.
 """
 
-# 일반 대화용 — 관련 청크가 없을 때 사용
+# 인사·잡담용 — query_type == "greeting"일 때만 사용
 _CHITCHAT_SYSTEM_PROMPT = """\
 당신은 회사 내부 문서 어시스턴트입니다.
-이 질문에 해당하는 사내 문서를 찾지 못했습니다.
-
-[판단 기준]
-- 질문이 회사·업무·사내 문서와 관련된 내용이면:
-  "사내 문서에서 해당 내용을 찾을 수 없습니다."라고만 답하라.
-- 인사·잡담·일반 지식·추천 등 문서와 무관한 대화라면:
-  자연스럽고 친근하게 답하라.
-
-[공통 규칙]
-- 한국어로 답하라.
-- 간결하게 답하라.
+인사나 잡담에는 자연스럽고 친근하게 짧게 답하라.
+한국어로 답하라.
 """
 
 
@@ -94,11 +94,13 @@ class RagResult(BaseModel):
     used_query:         str            # 실제 검색에 사용된 쿼리
     reformulated_query: str | None     # 지시어 재작성 결과 (디버깅)
     understood_query:   str | None     # 검색 최적화 변환 결과 (디버깅)
-    retrieved_count:    int
-    passed_threshold:   int
-    top_distance:       float | None
+    retrieved_count:    int            # BM25+벡터 union 후보 수 (RRF 입력 전 unique 청크 수)
+    passed_threshold:   int            # 품질 게이트 통과 후 LLM 전달 수
+    top_distance:       float | None   # 벡터 1위 청크의 cosine distance (있을 경우)
+    top_rrf_score:      float | None   # RRF 1위 청크의 점수 (디버깅)
+    debug_chunk_ids:    list[str]      # 품질 게이트 통과 전체 chunk_id (디버깅용 원본)
     fallback:           bool
-    fallback_reason:    str | None     # "no_docs" | "retrieval_error" | "llm_error"
+    fallback_reason:    str | None     # "no_docs" | "low_confidence" | "retrieval_error" | "llm_error"
 
 
 def _make_fallback(
@@ -108,6 +110,7 @@ def _make_fallback(
     retrieved_count: int = 0,
     passed_threshold: int = 0,
     top_distance: float | None = None,
+    top_rrf_score: float | None = None,
 ) -> RagResult:
     """fallback RagResult 생성 헬퍼. 반복 코드를 줄인다."""
     return RagResult(
@@ -120,6 +123,8 @@ def _make_fallback(
         retrieved_count=    retrieved_count,
         passed_threshold=   passed_threshold,
         top_distance=       top_distance,
+        top_rrf_score=      top_rrf_score,
+        debug_chunk_ids=    [],
         fallback=           True,
         fallback_reason=    reason,
     )
@@ -172,6 +177,8 @@ def handle_meta_query(ctx: QueryContext) -> RagResult:
             retrieved_count=    total_chunks,
             passed_threshold=   total_chunks,
             top_distance=       None,
+            top_rrf_score=      None,
+            debug_chunk_ids=    [],
             fallback=           False,
             fallback_reason=    None,
         )
@@ -180,106 +187,218 @@ def handle_meta_query(ctx: QueryContext) -> RagResult:
         return _make_fallback(ctx, "retrieval_error", _MSG_RETRIEVAL_ERROR)
 
 
-def handle_existence_query(ctx: QueryContext, req_id: str) -> RagResult:
+def handle_existence_query(
+    ctx: QueryContext,
+    req_id: str,
+    filters: dict | None = None,
+) -> RagResult:
     """
     "에너지 관련 특허 있어?" 같은 존재 확인 질문을 처리한다.
-    벡터 검색으로 관련 문서를 찾고, threshold 통과 여부로 존재/부재를 판단한다.
+
+    retrieve() + quality_gate()를 재사용해 BM25+벡터 하이브리드로 관련 문서를 탐색한다.
+    quality_gate 통과 청크의 source_file을 추출해 파일 목록을 반환한다.
+    LLM을 호출하지 않으므로 빠르다.
     """
     try:
-        raw = query_collection(
-            query_text=ctx.search_query,
-            collection_name=RAG_CONFIG["collection_name"],
-            persist_dir=RAG_CONFIG["persist_dir"],
-            embedding_provider=RAG_CONFIG["embedding_provider"],
-            n_results=RAG_CONFIG["n_results"],
-        )
-        distances = (raw.get("distances") or [[]])[0]
-        metadatas = (raw.get("metadatas") or [[]])[0]
+        chunks, union_count = retrieve(ctx.search_query, req_id, filters=filters)
+    except Exception as e:
+        logger.error("[%s] existence query 검색 실패: %s", req_id, e)
+        return _make_fallback(ctx, "retrieval_error", _MSG_RETRIEVAL_ERROR)
 
-        passed = [
-            (metadatas[i], distances[i])
-            for i in range(len(distances))
-            if distances[i] is not None and distances[i] <= RAG_CONFIG["existence_distance_threshold"]
-        ]
+    passed = quality_gate(chunks, req_id)
+    top_rrf = chunks[0].get("rrf_score") if chunks else None
+    top_distance = chunks[0].get("distance") if chunks else None
 
-        if not passed:
-            return RagResult(
-                answer=             "관련 문서가 등록되어 있지 않습니다.",
-                citations=          [],
-                query_type=         ctx.query_type,
-                used_query=         ctx.search_query,
-                reformulated_query= ctx.reformulated,
-                understood_query=   ctx.understood,
-                retrieved_count=    len(distances),
-                passed_threshold=   0,
-                top_distance=       distances[0] if distances else None,
-                fallback=           False,
-                fallback_reason=    None,
-            )
-
-        # 관련 파일 목록 중복 제거
-        files = []
-        seen = set()
-        for meta, _ in passed:
-            _m = meta or {}
-            f = _m.get("source_file") or _m.get("file_name", "")
-            if f and f not in seen:
-                seen.add(f)
-                files.append(f)
-
-        lines = [f"관련 문서 {len(files)}개가 있습니다.\n"]
-        for i, f in enumerate(files, 1):
-            lines.append(f"{i}. {f}")
-
+    if not passed:
         return RagResult(
-            answer=             "\n".join(lines),
+            answer=             "관련 문서가 등록되어 있지 않습니다.",
             citations=          [],
             query_type=         ctx.query_type,
             used_query=         ctx.search_query,
             reformulated_query= ctx.reformulated,
             understood_query=   ctx.understood,
-            retrieved_count=    len(distances),
-            passed_threshold=   len(passed),
-            top_distance=       distances[0] if distances else None,
+            retrieved_count=    union_count,
+            passed_threshold=   0,
+            top_distance=       top_distance,
+            top_rrf_score=      top_rrf,
+            debug_chunk_ids=    extract_debug_chunk_ids(chunks),
             fallback=           False,
-            fallback_reason=    None,
+            fallback_reason=    "no_docs",
         )
-    except Exception as e:
-        logger.error("[%s] existence query 처리 실패: %s", req_id, e)
-        return _make_fallback(ctx, "retrieval_error", _MSG_RETRIEVAL_ERROR)
+
+    # 통과 청크에서 파일명 추출 (순서 보존 dedup)
+    files = list(dict.fromkeys(
+        c["source_file"] for c in passed if c.get("source_file")
+    ))
+    lines = [f"관련 문서 {len(files)}개가 있습니다.\n"]
+    for i, f in enumerate(files, 1):
+        lines.append(f"{i}. {f}")
+
+    return RagResult(
+        answer=             "\n".join(lines),
+        citations=          [],
+        query_type=         ctx.query_type,
+        used_query=         ctx.search_query,
+        reformulated_query= ctx.reformulated,
+        understood_query=   ctx.understood,
+        retrieved_count=    union_count,
+        passed_threshold=   len(passed),
+        top_distance=       passed[0].get("distance"),
+        top_rrf_score=      top_rrf,
+        debug_chunk_ids=    extract_debug_chunk_ids(passed),
+        fallback=           False,
+        fallback_reason=    None,
+    )
 
 
 # =============================================================================
 # Content RAG 파이프라인
 # =============================================================================
+def _eval_filter(metadata: dict, where: dict) -> bool:
+    """
+    ChromaDB where절을 재귀적으로 평가한다.
+
+    지원 연산자: $and, $or, $eq, $ne, $in, $nin
+    단순 키-값 {"key": "value"}도 $eq와 동일하게 처리한다.
+
+    예시:
+        {"doc_type": "patent"}
+        {"$and": [{"doc_type": "patent"}, {"year": "2024"}]}
+        {"year": {"$in": ["2023", "2024"]}}
+    """
+    for key, val in where.items():
+        if key == "$and":
+            if not all(_eval_filter(metadata, clause) for clause in val):
+                return False
+        elif key == "$or":
+            if not any(_eval_filter(metadata, clause) for clause in val):
+                return False
+        else:
+            # key는 필드명, val은 직접 값이거나 {"$op": value} 형태
+            meta_val = metadata.get(key)
+            if isinstance(val, dict):
+                op, operand = next(iter(val.items()))
+                if op == "$eq"  and meta_val != operand:   return False
+                if op == "$ne"  and meta_val == operand:   return False
+                if op == "$in"  and meta_val not in operand: return False
+                if op == "$nin" and meta_val in operand:   return False
+            else:
+                if meta_val != val:
+                    return False
+    return True
+
+
+def _apply_bm25_filters(hits: list[dict], filters: dict | None) -> list[dict]:
+    """
+    BM25 결과에 ChromaDB where절 필터를 적용한다.
+
+    _eval_filter()로 중첩 필터($and/$or/$eq 등)까지 완전하게 평가한다.
+    Phase 2 메타데이터 필터링에서 벡터 검색 결과와 BM25 결과가 다른 범위를
+    커버하는 문제를 방지한다.
+    """
+    if not filters or not hits:
+        return hits
+    return [h for h in hits if _eval_filter(h.get("metadata") or {}, filters)]
+
+
+def _rrf_merge(
+    bm25_hits: list[dict],
+    vector_hits: list[dict],
+    top_n: int,
+    k: int = 60,
+) -> list[dict]:
+    """
+    Reciprocal Rank Fusion으로 BM25와 벡터 검색 결과를 합산한다.
+
+    각 청크의 RRF 점수 = 1/(k + bm25_rank) + 1/(k + vector_rank)
+      - 양쪽에 모두 등장한 청크: 두 점수 합산 → 자동 부스트
+      - 한 쪽만 등장한 청크:    해당 점수만 반영
+      - k=60: 표준값. 낮추면 상위 랭크 boost 강해짐
+
+    chunk_id를 key로 점수를 누적하므로 dedup이 자연스럽게 처리된다.
+    벡터 chunk를 base로 우선 사용하는 이유: distance 필드 보존.
+
+    # TODO: GPU 서버 구축 후 이 함수 대신 reranker 사용:
+    #   reranked = reranker.rerank(query, union, top_n=top_n)
+    """
+    scores: dict[str, float] = {}
+    vector_map: dict[str, dict] = {c["chunk_id"]: c for c in vector_hits}
+    bm25_map:   dict[str, dict] = {c["chunk_id"]: c for c in bm25_hits}
+
+    for rank, chunk in enumerate(bm25_hits):
+        cid = chunk["chunk_id"]
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+
+    for rank, chunk in enumerate(vector_hits):
+        cid = chunk["chunk_id"]
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+
+    sorted_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)
+
+    results = []
+    for cid in sorted_ids[:top_n]:
+        # 벡터 chunk 우선(distance 필드 있음), 없으면 BM25 chunk
+        base = vector_map.get(cid) or bm25_map[cid]
+        c = dict(base)
+        c["rrf_score"] = round(scores[cid], 6)
+        results.append(c)
+
+    return results
+
+
 def retrieve(
     query: str,
     req_id: str,
-    n_results: int = RAG_CONFIG["n_results"],
     filters: dict | None = None,
-) -> list[dict]:
-    """ChromaDB에서 유사 청크를 검색하고 평탄화된 list[dict]로 반환한다."""
+) -> tuple[list[dict], int]:
+    """
+    하이브리드 검색: BM25 + 벡터 검색 → RRF → top_n 반환.
+
+    흐름:
+    1. BM25 검색 (top_k=10) + 메타데이터 필터 적용
+       → 키워드 exact match에 강함 (특허번호, 날짜, 고유명사)
+
+    2. 벡터 검색 (top_k=10) + ChromaDB where 필터 적용
+       → 의미 유사성에 강함 (paraphrase, 설명형 질문)
+
+    3. RRF (Reciprocal Rank Fusion)
+       → BM25 순위 + 벡터 순위를 수식으로 합산
+       → chunk_id 기준 dedup 포함
+       → 양쪽 모두 등장한 청크 자동 부스트
+       → 최종 rrf_top_n(5)개 반환
+
+    Returns:
+        (merged_chunks, union_size)
+        merged_chunks : rrf_score 필드가 추가된 상위 top_n 청크 리스트
+        union_size    : RRF 입력 전 BM25+벡터 unique 후보 수 (retrieved_count 용)
+    """
     cfg = RAG_CONFIG
+
+    # ── Step 1: BM25 검색 + 필터 ───────────────────────────────────────────
+    bm25_raw  = bm25_retriever.search(query, top_k=cfg["bm25_top_k"])
+    bm25_hits = _apply_bm25_filters(bm25_raw, filters)
+    logger.info("[%s] BM25 검색: %d개 (필터 후 %d개)", req_id, len(bm25_raw), len(bm25_hits))
+
+    # ── Step 2: 벡터 검색 ──────────────────────────────────────────────────
     raw = query_collection(
         query_text=query,
         collection_name=cfg["collection_name"],
         persist_dir=cfg["persist_dir"],
         embedding_provider=cfg["embedding_provider"],
-        n_results=n_results,
+        n_results=cfg["vector_top_k"],
         where=filters,
     )
-
     ids       = raw.get("ids",       [[]])[0]
     documents = raw.get("documents", [[]])[0]
     metadatas = raw.get("metadatas", [[]])[0]
     distances = raw.get("distances", [[]])[0]
 
-    chunks = []
+    vector_hits = []
     for i, chunk_id in enumerate(ids):
         meta = metadatas[i] if i < len(metadatas) else {}
-        _m = meta or {}
+        _m   = meta or {}
         page = _m.get("page_number")
-        chunks.append({
+        vector_hits.append({
             "chunk_id":    chunk_id,
             "text":        documents[i] if i < len(documents) else "",
             "metadata":    meta,
@@ -287,23 +406,68 @@ def retrieve(
             "header":      _m.get("header") or (f"p.{page}" if page is not None else ""),
             "source_file": _m.get("source_file") or _m.get("file_name", ""),
         })
+    logger.info("[%s] 벡터 검색: %d개", req_id, len(vector_hits))
 
-    logger.info("[%s] retrieve 완료: %d개 청크 반환", req_id, len(chunks))
-    return chunks
+    # ── Step 3: RRF ────────────────────────────────────────────────────────
+    # union_size = RRF 입력 전 unique 후보 수. retrieved_count에 기록한다.
+    union_size = len({c["chunk_id"] for c in bm25_hits} | {c["chunk_id"] for c in vector_hits})
+    merged = _rrf_merge(bm25_hits, vector_hits, top_n=cfg["rrf_top_n"], k=cfg["rrf_k"])
+    logger.info(
+        "[%s] RRF 완료: union=%d → top%d | 최고점=%.6f",
+        req_id, union_size, len(merged),
+        merged[0]["rrf_score"] if merged else 0.0,
+    )
+    return merged, union_size
 
 
-def filter_by_threshold(
+def quality_gate(
     chunks: list[dict],
     req_id: str,
-    threshold: float = RAG_CONFIG["distance_threshold"],
 ) -> list[dict]:
-    """distance > threshold인 청크를 제거한다."""
-    passed = [c for c in chunks if c["distance"] is not None and c["distance"] <= threshold]
-    logger.info(
-        "[%s] threshold=%.2f 적용 → %d/%d 청크 통과",
-        req_id, threshold, len(passed), len(chunks),
-    )
-    return passed
+    """
+    벡터 distance 기반 품질 게이트. 확실히 무관한 결과만 걸러낸다.
+
+    RRF 결과 중 distance 필드가 있는 청크의 최솟값(best_distance)을 확인한다.
+    best_distance > distance_threshold 이면 관련 문서 없음으로 판단 → fallback.
+
+    distance가 없는 청크(BM25 전용)만 있는 경우 통과시킨다.
+    BM25 키워드 매칭 자체가 관련성의 신호이기 때문이다.
+
+    # TODO: reranker 활성화 시 이 함수를 rerank_score 기반으로 교체:
+    #   top_score = chunks[0].get("rerank_score") or 0.0
+    #   if top_score < RAG_CONFIG["min_rerank_score"]: return []
+
+    Returns:
+        통과한 청크 리스트 (비어 있으면 fallback으로 연결)
+    """
+    if not chunks:
+        return []
+
+    threshold = RAG_CONFIG["distance_threshold"]
+    distances = [c["distance"] for c in chunks if c.get("distance") is not None]
+
+    if distances:
+        best_distance = min(distances)
+        if best_distance > threshold:
+            logger.info(
+                "[%s] 품질 게이트 미통과: best_distance=%.4f > %.4f",
+                req_id, best_distance, threshold,
+            )
+            return []
+
+    if distances:
+        logger.info(
+            "[%s] 품질 게이트 통과: best_distance=%.4f top_rrf=%.6f",
+            req_id, min(distances), chunks[0].get("rrf_score") or 0.0,
+        )
+    else:
+        # 벡터 거리 없음 = BM25 전용 청크만 남은 상태. 키워드 매칭이 관련성 신호이므로 통과.
+        # distance 기반 품질 검증이 불가하므로 WARNING으로 기록.
+        logger.warning(
+            "[%s] 품질 게이트 통과(BM25 only): distance 없음 → 키워드 매칭 신뢰. top_rrf=%.6f",
+            req_id, chunks[0].get("rrf_score") or 0.0,
+        )
+    return chunks
 
 
 def build_context_block(
@@ -350,7 +514,11 @@ def build_prompt(query: str, context: str, chat_history: list | None = None) -> 
 def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
     """
     Gemini에 프롬프트를 전달하고 텍스트 답변을 반환한다.
-    429(rate limit) 에러는 지수 백오프로 최대 max_retries회 재시도한다.
+
+    재시도 정책:
+      - 503 등 일시적 서버 오류: 지수 백오프(1s → 2s)로 최대 max_retries회 재시도
+      - 429 / rate limit / quota 초과: 재시도 없이 즉시 예외를 던진다
+        (재시도해도 쿼터가 회복되지 않으므로 호출자가 빠르게 실패를 인지해야 함)
     """
     client = get_client()
     last_exc: Exception | None = None
@@ -390,8 +558,16 @@ def generate_answer(prompt: str, req_id: str, max_retries: int = 3) -> str:
 
 
 def format_citations(chunks: list[dict]) -> list[Citation]:
-    """(header, source_file) 기준 중복 제거 후 Citation 리스트 반환."""
-    seen, result = set(), []
+    """
+    사용자 노출용 Citation 리스트를 반환한다.
+
+    (header, source_file) 기준으로 중복 제거해 깔끔한 출처 목록을 만든다.
+    같은 섹션의 여러 청크가 답변에 기여했더라도 사용자에게는 하나의 출처로 표시된다.
+
+    청크 단위 원본 추적이 필요하면 debug_chunk_ids(RagResult 필드)를 사용한다.
+    """
+    seen: set[tuple] = set()
+    result: list[Citation] = []
     for c in chunks:
         key = (c["header"], c["source_file"])
         if key not in seen:
@@ -405,18 +581,28 @@ def format_citations(chunks: list[dict]) -> list[Citation]:
     return result
 
 
+def extract_debug_chunk_ids(chunks: list[dict]) -> list[str]:
+    """
+    디버깅용 chunk_id 전체 목록을 반환한다.
+
+    format_citations()는 (header, source_file) 기준 dedup을 하므로
+    같은 섹션의 여러 청크가 합쳐져 어느 청크가 실제로 답변에 기여했는지
+    추적이 어렵다. 이 함수는 dedup 없이 전체 chunk_id를 보존한다.
+    """
+    return [c["chunk_id"] for c in chunks]
+
+
 def _handle_chitchat(
     ctx: QueryContext,
     req_id: str,
     chat_history: list | None,
-    retrieved_count: int,
-    top_distance: float | None,
 ) -> RagResult:
     """
-    벡터 검색 통과 청크가 0개일 때 호출된다.
-    Gemini가 직접 판단해:
-      - 회사·문서 관련 질문 → "사내 문서에서 해당 내용을 찾을 수 없습니다" 안내
-      - 일반 대화·잡담·일반 지식 → 자유 답변
+    query_type == "greeting" 일 때 호출된다.
+    인사·잡담에 LLM이 자유롭게 답한다.
+
+    no-docs 경로(품질 게이트 미통과)에서는 호출하지 않는다.
+    관련 문서가 없으면 LLM 호출 없이 _MSG_NO_DOCS를 즉시 반환한다.
     """
     history = trim_history(chat_history) if chat_history else None
     history_block = ""
@@ -437,11 +623,7 @@ def _handle_chitchat(
         answer = generate_answer(prompt, req_id)
     except Exception as e:
         logger.error("[%s] chit-chat LLM 호출 실패: %s", req_id, e)
-        return _make_fallback(
-            ctx, "llm_error", _MSG_LLM_ERROR,
-            retrieved_count=retrieved_count,
-            top_distance=top_distance,
-        )
+        return _make_fallback(ctx, "llm_error", _MSG_LLM_ERROR)
 
     logger.info("[%s] chit-chat 응답 완료: %d자", req_id, len(answer))
     return RagResult(
@@ -451,9 +633,11 @@ def _handle_chitchat(
         used_query=         ctx.search_query,
         reformulated_query= ctx.reformulated,
         understood_query=   ctx.understood,
-        retrieved_count=    retrieved_count,
+        retrieved_count=    0,
         passed_threshold=   0,
-        top_distance=       top_distance,
+        top_distance=       None,
+        top_rrf_score=      None,
+        debug_chunk_ids=    [],
         fallback=           False,
         fallback_reason=    None,
     )
@@ -465,22 +649,33 @@ def _handle_content(
     filters: dict | None,
     chat_history: list | None = None,
 ) -> RagResult:
-    """일반 RAG 파이프라인. retrieve → filter → build → generate → cite."""
+    """일반 RAG 파이프라인. retrieve → quality_gate → build → generate → cite."""
     # 검색
     try:
-        chunks = retrieve(ctx.search_query, req_id, filters=filters)
+        chunks, union_count = retrieve(ctx.search_query, req_id, filters=filters)
     except Exception as e:
-        logger.error("[%s] ChromaDB 검색 실패: %s", req_id, e)
+        logger.error("[%s] 검색 실패: %s", req_id, e)
         return _make_fallback(ctx, "retrieval_error", _MSG_RETRIEVAL_ERROR)
 
-    # 필터
-    passed = filter_by_threshold(chunks, req_id)
+    # 품질 게이트: 관련 문서 없으면 LLM 호출 없이 즉시 반환
+    passed = quality_gate(chunks, req_id)
+    top_rrf = chunks[0].get("rrf_score") if chunks else None
     if not passed:
-        logger.info("[%s] 통과 청크 0개 → chit-chat 핸들러 위임", req_id)
-        return _handle_chitchat(
-            ctx, req_id, chat_history,
-            retrieved_count=len(chunks),
-            top_distance=chunks[0]["distance"] if chunks else None,
+        logger.info("[%s] 품질 게이트 미통과 → no_docs 응답 반환", req_id)
+        return RagResult(
+            answer=             _MSG_NO_DOCS,
+            citations=          [],
+            query_type=         ctx.query_type,
+            used_query=         ctx.search_query,
+            reformulated_query= ctx.reformulated,
+            understood_query=   ctx.understood,
+            retrieved_count=    union_count,
+            passed_threshold=   0,
+            top_distance=       chunks[0].get("distance") if chunks else None,
+            top_rrf_score=      top_rrf,
+            debug_chunk_ids=    extract_debug_chunk_ids(chunks),
+            fallback=           False,
+            fallback_reason=    "no_docs",
         )
 
     # 컨텍스트 + 프롬프트 (원본 질문으로 자연스럽게 답변, chat_history 반영)
@@ -495,9 +690,10 @@ def _handle_content(
         logger.error("[%s] LLM 호출 실패: %s", req_id, e)
         return _make_fallback(
             ctx, "llm_error", _MSG_LLM_ERROR,
-            retrieved_count=len(chunks),
+            retrieved_count=union_count,
             passed_threshold=len(passed),
-            top_distance=passed[0]["distance"],
+            top_distance=passed[0].get("distance"),
+            top_rrf_score=top_rrf,
         )
 
     result = RagResult(
@@ -507,16 +703,21 @@ def _handle_content(
         used_query=         ctx.search_query,
         reformulated_query= ctx.reformulated,
         understood_query=   ctx.understood,
-        retrieved_count=    len(chunks),
+        retrieved_count=    union_count,
         passed_threshold=   len(passed),
-        top_distance=       passed[0]["distance"],
+        top_distance=       passed[0].get("distance"),
+        top_rrf_score=      top_rrf,
+        debug_chunk_ids=    extract_debug_chunk_ids(passed),
         fallback=           False,
         fallback_reason=    None,
     )
     logger.info(
-        "[%s] 완료 | type=%s retrieved=%d passed=%d top_dist=%.4f",
+        "[%s] 완료 | type=%s retrieved=%d passed=%d top_dist=%s top_rrf=%.6f chunk_ids=%s",
         req_id, ctx.query_type, result.retrieved_count,
-        result.passed_threshold, result.top_distance or 0.0,
+        result.passed_threshold,
+        f"{result.top_distance:.4f}" if result.top_distance is not None else "N/A",
+        result.top_rrf_score or 0.0,
+        result.debug_chunk_ids,
     )
     return result
 
@@ -535,11 +736,12 @@ def ask(
     처리 흐름:
       1. process_query() → QueryContext (이해/재작성/라우팅)
       2. query_type에 따라 분기:
-           meta      → handle_meta_query()
-           existence → handle_existence_query()
+           greeting  → _handle_chitchat() (LLM 자유 답변)
+           meta      → handle_meta_query() (DB 현황 조회)
+           existence → handle_existence_query() (문서 존재 확인)
            content   → _handle_content()
-                         └ 청크 0개 → _handle_chitchat()
-                              └ Gemini 판단: 문서 관련 → "없습니다" / 일반 대화 → 자유 답변
+                         └ 품질 게이트 통과 → LLM 답변 + 출처
+                         └ 품질 게이트 미통과 → _MSG_NO_DOCS 즉시 반환 (LLM 호출 없음)
     """
     req_id = uuid.uuid4().hex[:8]
     logger.info("[%s] 질문 수신: %.80s", req_id, query)
@@ -554,10 +756,9 @@ def ask(
     )
 
     if ctx.query_type == "greeting":
-        return _handle_chitchat(ctx, req_id, chat_history, retrieved_count=0, top_distance=None)
+        return _handle_chitchat(ctx, req_id, chat_history)
     if ctx.query_type == "meta":
         return handle_meta_query(ctx)
     if ctx.query_type == "existence":
-        return handle_existence_query(ctx, req_id)
+        return handle_existence_query(ctx, req_id, filters)
     return _handle_content(ctx, req_id, filters, chat_history)
-
