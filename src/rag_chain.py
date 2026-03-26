@@ -17,6 +17,7 @@ from src.llm_api import GeminiAPIError, get_client
 from src.query_processor import QueryContext, QueryType, process_query, trim_history
 from src.vector_db import get_or_create_collection, query_collection
 import src.bm25_retriever as bm25_retriever
+import src.parent_store as parent_store
 # import src.reranker as reranker  # GPU 서버 구축 후 활성화
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ RAG_CONFIG = {
     # 벡터 검색 결과의 최솟값(best_distance)이 이 값 초과면 관련 문서 없음으로 판단.
     # reranker 활성화 시: min_rerank_score(0.1) 기반 게이트로 교체 가능.
     "distance_threshold": 0.65,
-    "max_context_chars":  6000,
+    "max_context_chars":  12000,
 }
 
 # 응답 메시지 상수
@@ -57,10 +58,12 @@ SYSTEM_PROMPT = """\
 1. 반드시 아래 [참고 문서]에 있는 내용에만 근거하여 답하라.
 2. 문서에 없는 내용은 절대 추측하거나 지어내지 말고, "해당 내용이 문서에 없습니다"라고 답하라.
 3. 본문에는 출처를 쓰지 말고, 답변 마지막에 아래 형식으로 출처를 모아서 표기하라.
+   - 반드시 답변 내용이 실제로 들어있는 청크의 파일명과 헤더명을 사용하라.
+   - 형식: 파일명.pdf > 헤더명 (순서 중요: 파일명이 먼저, 헤더명이 나중)
 
 📎 출처
-- {파일명} > {헤더명}
-- {파일명} > {헤더명}
+- 파일명.pdf > 헤더명
+- 파일명.pdf > 헤더명
 
 4. 표, 수치, 날짜는 원문 그대로 인용하라.
 5. 한국어로 답하라.
@@ -470,6 +473,69 @@ def quality_gate(
     return chunks
 
 
+def _expand_context(passed: list[dict], req_id: str) -> list[dict]:
+    """
+    child 청크를 parent intro + 인접 child 텍스트로 확장한다.
+    section 청크는 그대로 반환한다.
+
+    확장 순서: parent_intro → prev_child → hit_child → next_child
+    LLM이 맥락을 파악한 뒤 핵심(hit child)을 읽도록 유도한다.
+
+    parent_store가 비어 있거나(구 버전 청킹, 미로드) 해당 parent가 없으면
+    원본 chunk를 그대로 사용한다 — degradation 없는 fallback.
+    """
+    expanded = []
+    for chunk in passed:
+        meta       = chunk.get("metadata") or {}
+        chunk_type = meta.get("chunk_type") or chunk.get("chunk_type", "section")
+
+        if chunk_type != "child":
+            expanded.append(chunk)
+            continue
+
+        parent_id = meta.get("parent_chunk_id")
+        if not parent_id:
+            expanded.append(chunk)
+            continue
+
+        parent = parent_store.get_parent(parent_id)
+        if not parent:
+            # parent_store 미로드 또는 구 버전 청크 → 원본 그대로
+            expanded.append(chunk)
+            continue
+
+        adj_ids = parent_store.get_adjacent_child_ids(chunk["chunk_id"], window=1)
+
+        # parent_intro → prev_child → hit_child → next_child 순 조합
+        # parent_intro가 이미 헤더를 포함하므로 child 텍스트에서 첫 줄 헤더 제거
+        def _strip_md_header(text: str) -> str:
+            lines = text.strip().splitlines()
+            if lines and re.match(r"^\s*#{1,6}\s+", lines[0]):
+                return "\n".join(lines[1:]).strip()
+            return text.strip()
+
+        parts: list[str] = []
+        intro = (parent.get("intro_text") or "").strip()
+        if intro:
+            parts.append(intro)
+
+        for cid in adj_ids:
+            if cid == chunk["chunk_id"]:
+                parts.append(_strip_md_header(chunk["text"]))
+            else:
+                t = parent_store.get_child_text(cid)
+                if t:
+                    parts.append(_strip_md_header(t))
+
+        expanded_text = "\n\n".join(p for p in parts if p)
+        expanded_chunk        = dict(chunk)
+        expanded_chunk["text"] = expanded_text
+        expanded.append(expanded_chunk)
+
+    logger.debug("[%s] context 확장 완료: %d 청크", req_id, len(expanded))
+    return expanded
+
+
 def build_context_block(
     chunks: list[dict],
     req_id: str,
@@ -678,8 +744,11 @@ def _handle_content(
             fallback_reason=    "no_docs",
         )
 
+    # child 청크는 parent intro + 인접 child로 확장 (section은 그대로)
+    expanded = _expand_context(passed, req_id)
+
     # 컨텍스트 + 프롬프트 (원본 질문으로 자연스럽게 답변, chat_history 반영)
-    context = build_context_block(passed, req_id)
+    context = build_context_block(expanded, req_id)
     history = trim_history(chat_history) if chat_history else None
     prompt  = build_prompt(ctx.original_query, context, history)
 

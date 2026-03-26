@@ -62,7 +62,8 @@ def _tokenize(text: str) -> list[str]:
     text = text.lower()
     text = re.sub(r"[^\w\s\-\.]", " ", text)
     tokens = text.split()
-    return [t for t in tokens if len(t) > 1]
+    # 숫자(1, 2, ...)는 길이 1이어도 보존 — "청구항 1", "청구항 7" 구분에 필수
+    return [t for t in tokens if len(t) > 1 or t.isdigit()]
 
 
 def build_index(collection) -> None:

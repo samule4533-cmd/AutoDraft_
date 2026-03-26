@@ -1,3 +1,32 @@
+# src/chunker.py
+#
+# 역할: Markdown 텍스트를 RAG용 청크로 변환한다.
+#
+# ── 청크 타입 ──────────────────────────────────────────────────────────────────
+# section : 짧은 섹션 전체 → ChromaDB 저장 대상
+# parent  : 긴 섹션의 대표 맥락(intro) → JSON/in-memory 전용, ChromaDB X
+# child   : 긴 섹션의 분할 조각 → ChromaDB 저장 대상
+#
+# ── 긴 섹션 판단 (OR 조건) ────────────────────────────────────────────────────
+# 1. 본문 길이 > 1500자
+# 2. 의미 문단 수 > 3개
+# 3. 나열 패턴(청구항·제N항·번호 목록) 3회 이상 감지
+#
+# ── parent intro (adaptive) ──────────────────────────────────────────────────
+# 헤더 + 문단 누적. 목표 600자, 하한 350자, 상한 800자.
+# 첫 문단부터 시작해 목표 길이 도달 시 중단.
+#
+# ── child 청크 ID 체계 ────────────────────────────────────────────────────────
+# section : {document_id}_c{section_counter}
+# parent  : {document_id}_p{sec_idx}
+# child   : {document_id}_p{sec_idx}_ch{child_idx}
+#
+# ── 반환값 ────────────────────────────────────────────────────────────────────
+# section + parent + child 청크를 포함한 단일 리스트.
+# company_vectordb.py에서 chunk_type으로 라우팅:
+#   "section" | "child"  → ChromaDB upsert
+#   "parent"             → parent_index.json 집계
+
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -6,19 +35,124 @@ from typing import Any, Dict, List, Tuple
 # Config
 # =============================================================================
 CHUNKER_CONFIG = {
-    "section_max_len":       1500,  # 이 길이 이하 섹션은 1개 청크로 유지
-    "group_max_len":         1300,  # 긴 섹션을 문단 그룹으로 나눌 때 최대 길이
-    "min_chunk_content_len":   80,  # 헤더 제외 실질 본문이 이 길이 미만이면 청크 생성 안 함
-                                    # (구분자·헤더만 있는 쓸모없는 청크 방지)
+    # 섹션 분류 기준
+    "section_max_len":       1500,  # 본문 길이 상한 (초과 시 긴 섹션)
+    "max_paragraphs":           3,  # 의미 문단 수 상한 (초과 시 긴 섹션)
+    "enum_min_hits":            3,  # 나열 패턴 감지 최소 횟수
+    # child 분할 기준
+    "group_max_len":         1300,  # child 1개 최대 길이
+    "min_child_len":          200,  # child 최소 길이 (미만이면 인접 child와 병합)
+    # 섹션 품질 필터
+    "min_chunk_content_len":   80,  # 헤더 제외 실질 본문 최소 길이
+    # parent intro 길이 (adaptive)
+    "parent_intro_target":    600,  # 목표 길이
+    "parent_intro_min":       350,  # 하한 (미달 시 다음 문단 강제 추가)
+    "parent_intro_max":       800,  # 상한 (초과 시 강제 중단)
 }
 
+# 나열 패턴: 제1항 / 청구항 N / (1) ... / 1. 내용
+_ENUM_PATTERN = re.compile(
+    r"제\s*\d+\s*항"       # 제1항, 제 2 항
+    r"|청구항\s+\d+"        # 청구항 1, 청구항 2
+    r"|^\s*\(\d+\)\s"       # (1) 내용
+    r"|^\s*\d+\.\s+\S",     # 1. 내용
+    re.MULTILINE,
+)
 
-# ---------------------------------------------------------------------------
-# 내부 분리 헬퍼
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# 내부 헬퍼: 섹션 분류
+# =============================================================================
+
+def _has_enumeration_pattern(text: str) -> bool:
+    """나열 패턴이 enum_min_hits 이상이면 True."""
+    return len(_ENUM_PATTERN.findall(text)) >= CHUNKER_CONFIG["enum_min_hits"]
+
+
+def _needs_parent_child(section_text: str, non_empty_paras: List[str]) -> bool:
+    """
+    긴 섹션 여부 판단 (OR 조건).
+    True → parent + child 구조 생성.
+    False → section 청크 1개.
+
+    non_empty_paras: 길이 30자 이상인 의미 문단 리스트 (호출자가 전달).
+    """
+    if len(section_text) > CHUNKER_CONFIG["section_max_len"]:
+        return True
+    if len(non_empty_paras) > CHUNKER_CONFIG["max_paragraphs"]:
+        return True
+    if _has_enumeration_pattern(section_text):
+        return True
+    return False
+
+
+_SENTENCE_END = re.compile(
+    r"[다임음됩습]\.(?=\s|$)"   # 한국어 종결어미: 다. 임. 음. 됩. 습.
+    r"|[.!?](?=\s|$)",           # 영어/기호 문장 끝
+    re.MULTILINE,
+)
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    """
+    max_chars 이하의 마지막 완결 문장 끝 위치에서 자른다.
+    경계를 찾지 못하면 빈 문자열 반환 (호출자가 처리).
+    """
+    window = text[:max_chars]
+    last_end = -1
+    for m in _SENTENCE_END.finditer(window):
+        last_end = m.end()
+    if last_end > 0:
+        return window[:last_end].rstrip()
+    return ""
+
+
+def _extract_parent_intro(header: str, body_paras: List[str]) -> str:
+    """
+    헤더 + 앞쪽 문단 누적으로 parent intro 생성.
+
+    규칙:
+    - 섹션 앞쪽 문단부터 순서대로 누적 (앞 문단에 맥락이 집중됨)
+    - 문단 전체가 max_len을 초과하면:
+        - 이미 min_len 이상 확보 → 깔끔하게 중단
+        - min_len 미달 → 문장 끝 경계에서 잘라 추가 (문자 단위 컷 금지)
+    - target에 도달하면 중단
+
+    body_paras: 헤더 라인을 제외한 실질 문단 리스트 (순서 보존).
+    """
+    cfg = CHUNKER_CONFIG
+    target  = cfg["parent_intro_target"]
+    min_len = cfg["parent_intro_min"]
+    max_len = cfg["parent_intro_max"]
+
+    intro = header
+    for para in body_paras:
+        p = para.strip()
+        if not p:
+            continue
+        candidate = intro + "\n\n" + p
+        if len(candidate) > max_len:
+            if len(intro) >= min_len:
+                break  # 충분히 확보됨 → 깔끔하게 중단
+            # min_len 미달 → 문장 경계에서 자르기 (문자 단위 컷 금지)
+            space = max_len - len(intro) - 2
+            truncated = _truncate_at_sentence(p, space) if space > 0 else ""
+            if truncated:
+                intro = intro + "\n\n" + truncated
+            break
+        intro = candidate
+        if len(intro) >= target:
+            break
+
+    return intro.strip()
+
+
+# =============================================================================
+# 내부 헬퍼: 표·텍스트 분할 (기존 로직 유지)
+# =============================================================================
 
 def _is_table_paragraph(text: str) -> bool:
-    """문단의 50% 이상 행이 마크다운 표 형식(| 시작)이면 표로 판단"""
+    """문단의 50% 이상 행이 마크다운 표 형식(| 시작)이면 표로 판단."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return False
@@ -28,12 +162,12 @@ def _is_table_paragraph(text: str) -> bool:
 def _split_table_paragraph(text: str, max_len: int) -> List[str]:
     """
     마크다운 표를 헤더 행 보존하며 데이터 행 단위로 분리.
-    각 청크에 헤더+구분선을 반복 삽입해 컨텍스트 없이도 독립적으로 읽을 수 있게 함.
+    각 조각에 헤더+구분선을 반복 삽입해 독립적으로 읽을 수 있게 함.
     구분선(| --- |)이 없는 표는 원본 그대로 반환.
     """
     lines = text.strip().splitlines()
     header_lines: List[str] = []
-    data_lines: List[str] = []
+    data_lines:   List[str] = []
     found_sep = False
 
     for line in lines:
@@ -47,17 +181,17 @@ def _split_table_paragraph(text: str, max_len: int) -> List[str]:
     if not found_sep or not data_lines:
         return [text]
 
-    header_text = "\n".join(header_lines)
-    result: List[str] = []
-    current_rows: List[str] = []
-    current_len = len(header_text)
+    header_text    = "\n".join(header_lines)
+    result:        List[str] = []
+    current_rows:  List[str] = []
+    current_len    = len(header_text)
 
     for row in data_lines:
-        row_len = len(row) + 1  # +1 for \n
+        row_len = len(row) + 1
         if current_len + row_len > max_len and current_rows:
             result.append(header_text + "\n" + "\n".join(current_rows))
             current_rows = [row]
-            current_len = len(header_text) + row_len
+            current_len  = len(header_text) + row_len
         else:
             current_rows.append(row)
             current_len += row_len
@@ -70,17 +204,15 @@ def _split_table_paragraph(text: str, max_len: int) -> List[str]:
 
 def _split_text_paragraph(text: str, max_len: int) -> List[str]:
     """
-    긴 텍스트 문단을 분리:
-    1단계: 한국어 문장 경계(다. 임. 음. 등) 우선
-    2단계: 여전히 긴 경우 줄바꿈(\\n) 기준 강제 분리
-    단어/어절 중간 절단을 최대한 방지.
+    긴 텍스트 문단 분리.
+    1단계: 한국어 문장 경계(다. 임. 음. 등) 우선.
+    2단계: 여전히 긴 경우 줄바꿈 기준 강제 분리.
     """
     if len(text) <= max_len:
         return [text]
 
-    # 한국어 문장 끝 패턴 뒤 공백에서 분리
     sentence_end = r"(?<=[다임음됨함있없니]\.)\s+|(?<=[.!?])\s+"
-    sentences = re.split(sentence_end, text)
+    sentences    = re.split(sentence_end, text)
 
     groups: List[str] = []
     buf = ""
@@ -94,7 +226,6 @@ def _split_text_paragraph(text: str, max_len: int) -> List[str]:
     if buf:
         groups.append(buf.strip())
 
-    # 2단계: 여전히 긴 조각 → 줄바꿈 기준 분리
     result: List[str] = []
     for group in groups:
         if len(group) <= max_len:
@@ -115,48 +246,145 @@ def _split_text_paragraph(text: str, max_len: int) -> List[str]:
 
 
 def _preprocess_paragraph(text: str, max_len: int) -> Tuple[List[str], bool]:
-    """
-    문단을 max_len 이하 조각으로 분리.
-    반환: (조각 리스트, is_table)
-    """
+    """문단을 max_len 이하 조각으로 분리. 반환: (조각 리스트, is_table)."""
     if _is_table_paragraph(text):
         return _split_table_paragraph(text, max_len), True
     return _split_text_paragraph(text, max_len), False
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 내부 헬퍼: child 청크 생성
+# =============================================================================
+
+def _build_child_chunks(
+    sec:           Dict[str, Any],
+    base_metadata: Dict[str, Any],
+    document_id:   str,
+    sec_idx:       int,
+) -> List[Dict[str, Any]]:
+    """
+    긴 섹션을 child 청크 리스트로 분할한다.
+
+    처리 순서:
+      1. 빈 줄 기준 문단 분리
+      2. 표 → 독립 child (헤더 행 보존 분리)
+         텍스트 → group_max_len 이하로 그룹핑
+      3. min_child_len 미만 텍스트 child → 인접 child와 병합
+      4. chunk_id 할당 ({document_id}_p{sec_idx}_ch{i})
+
+    chunk_position / child_index / child_count / parent_chunk_id 는
+    호출자(_split_markdown_into_chunks)에서 설정한다.
+    """
+    cfg        = CHUNKER_CONFIG
+    group_max  = cfg["group_max_len"]
+    min_child  = cfg["min_child_len"]
+    sec_text   = sec["text"].strip()
+
+    # ── 1단계: 문단 분리 후 표/텍스트 조각으로 분해 ─────────────────────────
+    raw_pieces: List[Tuple[str, bool]] = []  # (text, is_table)
+    for para in re.split(r"\n\s*\n", sec_text):
+        p = para.strip()
+        if not p:
+            continue
+        pieces, is_table = _preprocess_paragraph(p, group_max)
+        for piece in pieces:
+            piece = piece.strip()
+            if piece:
+                raw_pieces.append((piece, is_table))
+
+    # ── 2단계: 표는 독립, 텍스트는 group_max_len 이하로 묶기 ─────────────────
+    grouped: List[Tuple[str, bool]] = []
+    buf:     List[str] = []
+    buf_len  = 0
+
+    for piece, is_table in raw_pieces:
+        if is_table:
+            if buf:
+                grouped.append(("\n\n".join(buf).strip(), False))
+                buf     = []
+                buf_len = 0
+            grouped.append((piece, True))
+        else:
+            if buf_len + len(piece) > group_max and buf:
+                grouped.append(("\n\n".join(buf).strip(), False))
+                buf     = []
+                buf_len = 0
+            buf.append(piece)
+            buf_len += len(piece)
+
+    if buf:
+        grouped.append(("\n\n".join(buf).strip(), False))
+
+    # ── 3단계: min_child_len 미만 텍스트 child → 앞 child와 병합 ─────────────
+    # 표 child는 병합 제외 (표 구조 훼손 방지)
+    merged: List[Tuple[str, bool]] = []
+    for text, is_table in grouped:
+        if (
+            not is_table
+            and merged
+            and len(text) < min_child
+            and not merged[-1][1]
+        ):
+            prev_text, _ = merged[-1]
+            merged[-1]   = (prev_text + "\n\n" + text, False)
+        else:
+            merged.append((text, is_table))
+
+    # ── 4단계: child 청크 객체 생성 ─────────────────────────────────────────
+    children: List[Dict[str, Any]] = []
+    for i, (text, is_table) in enumerate(merged):
+        has_tbl = is_table or any(
+            l.strip().startswith("|") for l in text.splitlines()
+        )
+        children.append({
+            "chunk_id":   f"{document_id}_p{sec_idx}_ch{i}",
+            "chunk_type": "child",
+            "header":     sec["header"],
+            "text":       text,
+            "metadata": {
+                **base_metadata,
+                "chunk_type": "child",
+                "has_table":  has_tbl,
+                # chunk_position / child_index / child_count / parent_chunk_id
+                # → 호출자에서 설정
+            },
+        })
+
+    return children
+
+
+# =============================================================================
 # 메인 청킹 함수
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 def split_markdown_into_chunks(
     markdown_text: str,
-    document_id: str,
-    source_pdf: Path,
-    model_name: str,
-    source_type: str = "gemini_file_api_markdown",
-    section_max_len: int = CHUNKER_CONFIG["section_max_len"],
-    group_max_len: int = CHUNKER_CONFIG["group_max_len"],
-    min_chunk_content_len: int = CHUNKER_CONFIG["min_chunk_content_len"],
+    document_id:   str,
+    source_pdf:    Path,
+    model_name:    str,
+    source_type:   str = "gemini_file_api_markdown",
 ) -> List[Dict[str, Any]]:
     """
-    RAG용 chunking:
-    - Markdown 헤더(#, ##, ###) 기준 1차 분리
-    - 긴 섹션은 문단 단위 2차 분리
-      · 표(chunk_type='table'): 헤더 행 보존하며 행 그룹 분리
-      · 텍스트(chunk_type='paragraph_group'): 문장 경계 → 줄바꿈 기준 분리
-    - 메타데이터: has_table, chunk_position 포함
-      · has_table: 청크 내 표 포함 여부 (retrieval 필터링용)
-      · chunk_position: 섹션 내 위치 (only/first/middle/last) - 계층적 청킹 전환 시 활용
+    Markdown 텍스트를 RAG용 청크 리스트로 변환한다.
+
+    반환 리스트에는 section / parent / child 청크가 모두 포함된다.
+    company_vectordb.py에서 chunk_type으로 라우팅해 ChromaDB/parent_index에 분리 저장한다.
+
+    chunk_id 체계:
+      section  {document_id}_c{N}           (N: section 청크 전용 카운터)
+      parent   {document_id}_p{sec_idx}     (sec_idx: 헤더 기준 섹션 순서)
+      child    {document_id}_p{sec_idx}_ch{i}
     """
+    cfg  = CHUNKER_CONFIG
     text = (markdown_text or "").strip()
     if not text:
         return []
 
-    # 1단계: 헤더 기준 섹션 분리
-    lines = text.splitlines()
-    sections: List[Dict[str, Any]] = []
-    current_header = "ROOT"
-    current_lines: List[str] = []
+    # ── 1단계: 헤더 기준 섹션 분리 ─────────────────────────────────────────
+    lines:           List[str]         = text.splitlines()
+    sections:        List[Dict]        = []
+    current_header   = "ROOT"
+    current_lines:   List[str]         = []
 
     def flush_section() -> None:
         nonlocal current_lines, current_header
@@ -165,26 +393,18 @@ def split_markdown_into_chunks(
             current_lines = []
             return
 
-        # [필터 1] 헤더 라인(# 으로 시작) 제외 → 실제 본문만 추출
+        # 헤더 라인·구분자 제거 후 실질 본문 길이 확인
         content_lines = [
             l for l in body.splitlines()
             if not re.match(r"^\s*#{1,6}\s+", l)
         ]
-
-        # [필터 2] 구분자만 있는 줄(---, ===, ___ 등) 제거
-        # Gemini가 프롬프트 지침을 완벽히 따르지 않아 구분자가 남는 경우 방어.
-        # 페이지 구분선이 독립 섹션으로 잘려도 청크가 되지 않도록 차단.
-        meaningful_lines = [
+        meaningful = [
             l for l in content_lines
             if l.strip() and not re.match(r"^[-=_*]{2,}\s*$", l.strip())
         ]
-        content_text = "\n".join(meaningful_lines).strip()
+        content_text = "\n".join(meaningful).strip()
 
-        # [필터 3] 실질 본문이 min_chunk_content_len 미만이면 청크로 만들지 않음
-        # 특허 메타 한 줄짜리("발명자: 홍길동"), 빈 섹션 헤더 등이 청크가 되어
-        # 벡터 임베딩이 약해지고 reranker 판단 근거가 없어지는 문제 방지.
-        # 프롬프트 수정 후에도 Gemini 출력 변동성으로 발생할 수 있는 짧은 청크의 안전망.
-        if content_text and len(content_text) >= min_chunk_content_len:
+        if content_text and len(content_text) >= cfg["min_chunk_content_len"]:
             sections.append({"header": current_header, "text": body})
 
         current_lines = []
@@ -198,138 +418,90 @@ def split_markdown_into_chunks(
             current_lines.append(line)
     flush_section()
 
-    # 2단계: 섹션 → 청크
-    all_chunks: List[Dict[str, Any]] = []
-    chunk_idx = 1
+    # ── 2단계: 섹션 → 청크 변환 ─────────────────────────────────────────────
+    all_chunks:       List[Dict[str, Any]] = []
+    section_counter   = 1   # section 청크 전용 카운터
 
     for sec_idx, sec in enumerate(sections, start=1):
         sec_text = sec["text"].strip()
-        base_metadata = {
-            "document_id": document_id,
-            "source_file": source_pdf.name,
+
+        base_metadata: Dict[str, Any] = {
+            "document_id":   document_id,
+            "source_file":   source_pdf.name,
             "section_order": sec_idx,
-            "header": sec["header"],
-            "source": source_type,
-            "model": model_name,
+            "header":        sec["header"],
+            "source":        source_type,
+            "model":         model_name,
         }
 
-        # 이 섹션의 청크를 먼저 수집 → chunk_position 계산 후 추가
-        sec_chunks: List[Dict[str, Any]] = []
+        # 문단 분리: 헤더 제외 실질 문단 (needs_parent_child + intro 추출에 공통 사용)
+        raw_paras  = re.split(r"\n\s*\n", sec_text)
+        body_paras = [
+            p.strip() for p in raw_paras
+            if p.strip() and not re.match(r"^\s*#{1,6}\s+", p.strip())
+        ]
+        non_empty_paras = [p for p in body_paras if len(p) > 30]
 
-        if len(sec_text) <= section_max_len:
-            # 섹션 전체가 짧으면 1개 청크
-            has_table = _is_table_paragraph(sec_text)
-            sec_chunks.append({
-                "chunk_id": f"{document_id}_c{chunk_idx}",
-                "header": sec["header"],
-                "text": sec_text,
+        if not _needs_parent_child(sec_text, non_empty_paras):
+            # ── 짧은 섹션: section 청크 1개 ─────────────────────────────────
+            all_chunks.append({
+                "chunk_id":   f"{document_id}_c{section_counter}",
+                "chunk_type": "section",
+                "header":     sec["header"],
+                "text":       sec_text,
                 "metadata": {
                     **base_metadata,
-                    "chunk_type": "section",
-                    "has_table": has_table,
+                    "chunk_type":     "section",
+                    "has_table":      _is_table_paragraph(sec_text),
+                    "chunk_position": "only",
                 },
             })
-            chunk_idx += 1
+            section_counter += 1
+
         else:
-            # 긴 섹션: 빈 줄 기준 문단 분리 후 처리
-            paras = re.split(r"\n\s*\n", sec_text)
-            buf: List[str] = []
-            buf_len = 0
+            # ── 긴 섹션: parent + child 구조 ────────────────────────────────
+            parent_id = f"{document_id}_p{sec_idx}"
 
-            for para in paras:
-                p = para.strip()
-                if not p:
-                    continue
+            # child 청크 생성
+            children    = _build_child_chunks(sec, base_metadata, document_id, sec_idx)
+            child_count = len(children)
 
-                pieces, is_table = _preprocess_paragraph(p, group_max_len)
-
-                if is_table:
-                    # 표: 쌓인 텍스트 buf 먼저 flush 후 표 청크 독립 추가
-                    if buf:
-                        joined = "\n\n".join(buf).strip()
-                        has_tbl = any(l.strip().startswith("|") for l in joined.splitlines())
-                        sec_chunks.append({
-                            "chunk_id": f"{document_id}_c{chunk_idx}",
-                            "header": sec["header"],
-                            "text": joined,
-                            "metadata": {
-                                **base_metadata,
-                                "chunk_type": "paragraph_group",
-                                "has_table": has_tbl,
-                            },
-                        })
-                        chunk_idx += 1
-                        buf = []
-                        buf_len = 0
-
-                    for piece in pieces:
-                        piece = piece.strip()
-                        if not piece:
-                            continue
-                        sec_chunks.append({
-                            "chunk_id": f"{document_id}_c{chunk_idx}",
-                            "header": sec["header"],
-                            "text": piece,
-                            "metadata": {
-                                **base_metadata,
-                                "chunk_type": "table",
-                                "has_table": True,
-                            },
-                        })
-                        chunk_idx += 1
+            # child 메타데이터 완성
+            for i, child in enumerate(children):
+                if child_count == 1:
+                    pos = "only"
+                elif i == 0:
+                    pos = "first"
+                elif i == child_count - 1:
+                    pos = "last"
                 else:
-                    # 텍스트: pre-split 조각을 buf에 그룹핑
-                    for piece in pieces:
-                        piece = piece.strip()
-                        if not piece:
-                            continue
-                        if buf_len + len(piece) > group_max_len and buf:
-                            joined = "\n\n".join(buf).strip()
-                            sec_chunks.append({
-                                "chunk_id": f"{document_id}_c{chunk_idx}",
-                                "header": sec["header"],
-                                "text": joined,
-                                "metadata": {
-                                    **base_metadata,
-                                    "chunk_type": "paragraph_group",
-                                    "has_table": False,
-                                },
-                            })
-                            chunk_idx += 1
-                            buf = []
-                            buf_len = 0
-                        buf.append(piece)
-                        buf_len += len(piece)
-
-            # 남은 텍스트 buf flush
-            if buf:
-                joined = "\n\n".join(buf).strip()
-                has_tbl = any(l.strip().startswith("|") for l in joined.splitlines())
-                sec_chunks.append({
-                    "chunk_id": f"{document_id}_c{chunk_idx}",
-                    "header": sec["header"],
-                    "text": joined,
-                    "metadata": {
-                        **base_metadata,
-                        "chunk_type": "paragraph_group",
-                        "has_table": has_tbl,
-                    },
+                    pos = "middle"
+                child["metadata"].update({
+                    "parent_chunk_id": parent_id,
+                    "child_index":     i,
+                    "child_count":     child_count,
+                    "chunk_position":  pos,
                 })
-                chunk_idx += 1
 
-        # chunk_position 할당 (계층적 청킹 전환 시 parent 탐색에 활용)
-        n = len(sec_chunks)
-        for i, c in enumerate(sec_chunks):
-            if n == 1:
-                pos = "only"
-            elif i == 0:
-                pos = "first"
-            elif i == n - 1:
-                pos = "last"
-            else:
-                pos = "middle"
-            c["metadata"]["chunk_position"] = pos
+            # parent intro 추출 (adaptive)
+            intro_text = _extract_parent_intro(sec["header"], body_paras)
 
-        all_chunks.extend(sec_chunks)
+            # parent 청크 ("text" 필드 없음 → ChromaDB 혼입 방지)
+            parent_chunk: Dict[str, Any] = {
+                "chunk_id":   parent_id,
+                "chunk_type": "parent",
+                "header":     sec["header"],
+                "intro_text": intro_text,
+                "child_ids":  [c["chunk_id"] for c in children],
+                "metadata": {
+                    **base_metadata,
+                    "chunk_type":  "parent",
+                    "child_count": child_count,
+                    "has_table":   any(c["metadata"]["has_table"] for c in children),
+                },
+            }
+
+            all_chunks.append(parent_chunk)
+            all_chunks.extend(children)
 
     return all_chunks

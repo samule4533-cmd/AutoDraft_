@@ -59,7 +59,7 @@ SAVE_FINAL_MD = True
 SAVE_FINAL_JSON = True
 SAVE_PARSE_REPORT = True
 SAVE_FIELDS_JSON = True
-SAVE_VECTOR_CHUNKS = True
+SAVE_VECTOR_CHUNKS = False  # vector_chunks.json 미저장 — *.md가 재청킹 소스
 
 # =============================================================================
 # 파싱 프롬프트 (모듈형)

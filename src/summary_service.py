@@ -124,7 +124,10 @@ def _generate_summaries(
     resp = get_client().models.generate_content(
         model=os.getenv("GEMINI_RAG_MODEL", "gemini-2.0-flash"),
         contents=[prompt],
-        config=types.GenerateContentConfig(temperature=0.0),
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=8192,
+        ),
     )
     raw = (getattr(resp, "text", "") or "").strip()
 

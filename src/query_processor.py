@@ -65,14 +65,18 @@ _REFORMULATION_PROMPT = """\
 """
 
 _UNDERSTANDING_PROMPT = """\
-사용자가 사내 문서 검색 시스템에 아래 질문을 입력했다.
+사용자가 사내 특허·기술 문서 검색 시스템에 아래 질문을 입력했다.
 이 질문을 벡터 검색에 최적화된 형태로 변환하라.
 
 [규칙]
 1. 구어체, 조사, 불필요한 표현 제거
 2. 핵심 기술 용어와 개념 중심으로 재작성
 3. 날짜/번호/이름 등 정형 필드를 묻는 질문이면 해당 필드명을 명시적으로 포함
-4. 한 문장으로 출력. 다른 설명 없이 변환된 문장만 출력
+   - 특히 "청구항 N", "제N항" 같은 특허 청구항 번호는 반드시 "청구항 N" 형태(숫자 그대로)로 보존하라
+4. 동의어·유사어를 병기해 검색 범위를 넓혀라. 예: "창호" → "창호 창문", "냉방" → "냉방 에어컨 냉각"
+5. 한 문장으로 출력. 다른 설명 없이 변환된 문장만 출력
+6. 질문이 개인 감정/식사/날씨/일상 잡담이고 특허·기술 키워드가 단 하나도 없을 때만
+   "[[CHITCHAT]]" 을 그대로 출력하라 (조금이라도 업무/기술 관련이면 변환 진행)
 
 [질문]
 {query}
@@ -83,6 +87,29 @@ _UNDERSTANDING_PROMPT = """\
 # =============================================================================
 # 패턴 상수
 # =============================================================================
+# 청구항 번호 정규화: "제N항", "N항" → "청구항 N"
+# BM25 인덱스에는 "청구항 1" 형태로 저장되어 있으므로 검색 쿼리도 동일 형태로 통일한다.
+# "제1항", "1항", "제 1항" 등 다양한 표현을 커버하되
+# "1항목", "2항목" 처럼 뒤에 다른 문자가 이어지는 경우는 제외한다.
+_CLAIM_NUM_PATTERN = re.compile(r"제\s*(\d+)\s*항|(?<!\w)(\d+)\s*항(?!\w)")
+
+
+def _normalize_claim_terms(text: str) -> str:
+    """
+    특허 청구항 번호 표현을 BM25 인덱스 형태와 일치하도록 정규화한다.
+
+    "제N항", "N항" → "청구항 N"
+    "청구항 N항", "청구항 제N항" → "청구항 N" (중복 제거)
+    """
+    # "제N항" → "청구항 N"
+    text = re.sub(r"제\s*(\d+)\s*항(?!\w)", r"청구항 \1", text)
+    # "N항" (앞에 단어 없는 경우) → "청구항 N"
+    text = re.sub(r"(?<!\w)(\d+)\s*항(?!\w)", r"청구항 \1", text)
+    # "청구항 청구항 N" 중복 정리
+    text = re.sub(r"청구항\s+청구항\s+(\d+)", r"청구항 \1", text)
+    return text
+
+
 # reformulation: 지시어 포함 여부 감지
 _REFERENTIAL_PATTERN = re.compile(r"그럼|거기|그건|그것|해당|방금|그거|그 ")
 
@@ -91,9 +118,21 @@ _COLLOQUIAL_PATTERN = re.compile(
     r"알려줘|알려주세요|뭐야|뭐지|어때|있어|있나|있나요|해줘|가르쳐|얼마야|언제야|어디야|뭐가|어떻게"
 )
 
-# routing — greeting: 인사·잡담 (벡터 검색 없이 바로 chitchat으로)
+# routing — greeting/chitchat: 인사·잡담·일상 표현 (벡터 검색 없이 바로 chitchat으로)
+# understanding 전에 체크해야 LLM이 업무 맥락으로 오매핑하는 것을 막는다.
 _GREETING_PATTERN = re.compile(
-    r"^(안녕|하이|헬로|ㅎㅇ|hi|hello|hey|반가워|반갑|고마워|감사|ㄱㅅ|ㅊㅋ|축하|잘있어|잘가|bye|굿모닝|좋은\s*아침|뭐해|뭐하고있어|심심|놀자)\s*[~!?ㅎㅋ]*$",
+    # 인사
+    r"^(안녕|하이|헬로|ㅎㅇ|hi|hello|hey|반가워|반갑|고마워|감사|ㄱㅅ|ㅊㅋ|축하|잘있어|잘가|bye|굿모닝|좋은\s*아침|뭐해|뭐하고있어|심심|놀자)"
+    r"\s*[~!?ㅎㅋ]*$"
+    # 감정·컨디션 (단독 표현)
+    r"|^(피곤|힘들|졸려|졸리|지쳐|지침|배고파|배고프|배불러|기뻐|슬퍼|슬프|화나|짜증|우울|설레|두근|행복|즐거|재밌|재미없|지루|답답)"
+    r"[아어워해다]?\s*[~!?ㅎㅋㅠㅜ]*$"
+    # 식사·메뉴 관련
+    r"|.{0,6}(저녁|점심|아침|밥|메뉴)\s*(뭐|추천|먹지|먹을까|먹어|알려줘|추천해)\s*[~!?]*$"
+    r"|^(뭐\s*먹|오늘\s*뭐\s*먹|점심\s*뭐|저녁\s*뭐).{0,10}$"
+    # 날씨·일상
+    r"|^오늘\s*(날씨|기온|비\s*와|눈\s*와).{0,10}$"
+    r"|^(주말|오늘|내일).{0,6}(뭐\s*해|뭐\s*하|계획|놀자).{0,6}$",
     re.IGNORECASE,
 )
 
@@ -211,6 +250,9 @@ def understand_query(query: str, req_id: str) -> str:
         if not result or len(result) < 5:
             logger.warning("[%s] understanding 비정상 → 원본 사용: %r", req_id, result)
             return query
+        if "[[CHITCHAT]]" in result:
+            logger.info("[%s] understanding: %r → chitchat 감지", req_id, query)
+            return "[[CHITCHAT]]"
         logger.info("[%s] understanding: %r → %r", req_id, query, result)
         return result
     except Exception as e:
@@ -289,10 +331,23 @@ def process_query(
     understood: str | None = None
     if query_type == "content" and should_understand(base_query):
         result = understand_query(base_query, req_id)
-        if result != base_query:
+        if result == "[[CHITCHAT]]":
+            # understanding 단계에서 잡담 감지 → greeting으로 전환
+            query_type = "greeting"
+        elif result != base_query:
             understood = result
 
-    search_query = understood if understood else base_query
+    # 5. 청구항 번호 정규화 — understanding 전후 모두 적용
+    # "제N항", "N항" → "청구항 N" 으로 통일해 BM25 인덱스 형태와 일치시킨다.
+    # understanding이 실행됐으면 understood 결과에, 아니면 base_query에 적용한다.
+    raw_search = understood if understood else base_query
+    normalized = _normalize_claim_terms(raw_search)
+    if normalized != raw_search:
+        logger.info("[%s] claim 정규화: %r → %r", req_id, raw_search, normalized)
+        if understood is not None:
+            understood = normalized
+        # base_query 자체에서 왔을 경우 search_query에만 반영 (original_query는 유지)
+    search_query = normalized
 
     return QueryContext(
         original_query=query,

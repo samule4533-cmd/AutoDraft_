@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import src.bm25_retriever as bm25_retriever
+import src.parent_store as parent_store
 # import src.reranker as reranker  # GPU 서버 구축 후 활성화
 from src.pdf_parser import parse_single_pdf
 from src.rag_chain import RAG_CONFIG, RagResult, ask
@@ -59,6 +60,12 @@ async def lifespan(app: FastAPI):
             bm25_retriever.build_index(col)
         except Exception as e:
             logger.warning("BM25 인덱스 빌드 실패 (서버는 계속 실행됨): %s", e)
+
+    # parent_store 로드 — parent_index.json → 인메모리 인덱스 빌드
+    try:
+        parent_store.load()
+    except Exception as e:
+        logger.warning("parent_store 로드 실패 (서버는 계속 실행됨): %s", e)
 
     # jina reranker 모델 로드 (~280MB, 최초 실행 시 HuggingFace에서 다운로드)
     # try:
@@ -196,6 +203,11 @@ async def ingest(
     for chunk in chunks:
         chunk.setdefault("metadata", {})["file_id"] = file_id
 
+    # chunk_type별 라우팅 — parent는 ChromaDB 제외, parent_index.json으로 분리
+    chroma_chunks  = [c for c in chunks if c.get("chunk_type", "section") in ("section", "child")]
+    new_parents    = [c for c in chunks if c.get("chunk_type") == "parent"]
+    child_map      = {c["chunk_id"]: c for c in chunks if c.get("chunk_type") == "child"}
+
     # 기존 청크 삭제 후 upsert (재처리 시 중복 방지)
     col = get_or_create_collection(
         persist_dir=RAG_CONFIG["persist_dir"],
@@ -208,7 +220,7 @@ async def ingest(
         pass  # 기존 청크 없으면 무시
 
     upsert_chunks_to_chroma(
-        chunks=chunks,
+        chunks=chroma_chunks,
         collection_name=RAG_CONFIG["collection_name"],
         persist_dir=RAG_CONFIG["persist_dir"],
         embedding_provider=RAG_CONFIG["embedding_provider"],
@@ -218,14 +230,24 @@ async def ingest(
     # ChromaDB 적재 완료 후 raw PDF 삭제.
     pdf_path.unlink(missing_ok=True)
 
+    # parent_index.json 병합 + parent_store 인메모리 재로드
+    if new_parents:
+        try:
+            parent_store.merge_parents(new_parents, child_map)
+        except Exception as e:
+            logger.warning("parent_store 병합 실패 (context 확장 불가): %s", e)
+
     # BM25 인덱스 재빌드 — 새 청크가 추가됐으므로 인메모리 인덱스를 갱신한다.
     try:
         bm25_retriever.rebuild_index(col)
     except Exception as e:
         logger.warning("BM25 재빌드 실패 (검색은 이전 인덱스로 동작): %s", e)
 
-    logger.info("적재 완료: file_id=%s | chunks=%d", file_id, len(chunks))
-    return {"chunk_count": len(chunks), "file_id": file_id, "file_name": file_name}
+    logger.info(
+        "적재 완료: file_id=%s | chroma=%d parent=%d",
+        file_id, len(chroma_chunks), len(new_parents),
+    )
+    return {"chunk_count": len(chroma_chunks), "file_id": file_id, "file_name": file_name}
 
 
 class RenameRequest(BaseModel):
@@ -290,6 +312,12 @@ def delete_ingest(file_id: str):
     except Exception as e:
         logger.error("청크 삭제 실패: %s | %s", file_id, e)
         raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
+
+    # parent_index.json에서 해당 문서 parent 항목 제거 + 인메모리 재로드
+    try:
+        parent_store.remove_by_document(file_id)
+    except Exception as e:
+        logger.warning("parent_store 제거 실패 (이전 상태로 동작): %s", e)
 
     # BM25 재빌드 — 삭제된 청크가 검색 결과에 계속 등장하는 것을 방지
     try:

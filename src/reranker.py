@@ -58,10 +58,19 @@ def load_model() -> None:
         logger.info("reranker 모델 로딩 시작: %s", MODEL_NAME)
         # CPU 환경에서는 float16이 지원되지 않아 "could not execute a primitive" 오류 발생.
         # GPU 여부를 직접 확인해 dtype을 명시적으로 결정한다.
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if torch.cuda.is_available():
+            dtype = torch.float16
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            dtype = torch.float16
+            device = "mps"
+        else:
+            dtype = torch.float32
+            device = "cpu"
         _model = CrossEncoder(
             MODEL_NAME,
             model_kwargs={"torch_dtype": dtype},
+            device=device,
             trust_remote_code=True,
             activation_fn=torch.nn.Sigmoid(),
         )
