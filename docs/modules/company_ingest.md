@@ -1,269 +1,152 @@
 # company_ingest.py
 
+회사 문서 PDF 배치 파싱 파이프라인. `data/raw/company/` 스캔 → 신규 파일 파싱 → ChromaDB + parent_index 적재까지 한 번에 실행. `--rechunk-only` 모드로 재파싱 없이 재청킹도 지원.
+
 ## 개요
-`company_ingest.py`는 회사 문서 PDF를 일괄 처리하는 배치 파싱 파이프라인이다.  
-지정된 입력 디렉터리 하위의 모든 PDF를 스캔하고, 아직 처리되지 않은 문서만 파싱하여 결과를 저장한다.
 
-이 파일의 핵심 목적은 다음과 같다.
-
-- 회사 문서 PDF를 일괄 탐색
-- 이미 처리된 문서는 건너뛰고 신규 문서만 파싱
-- 파싱 실패 시 재시도
-- 최종 실패 문서는 로그로 기록
-- 파싱 완료 후 ChromaDB 적재까지 자동 실행 (one-command)
-
-즉, 이 모듈은 **PDF 수집부터 ChromaDB 적재까지 전 과정을 명령어 하나로 완료하는 인제스트 자동화 진입점**이다.
+`company_ingest.py`는 PDF 수집부터 ChromaDB 적재까지 전 과정을 명령어 하나로 완료하는 배치 인제스트 진입점이다. 개별 파싱 로직은 `pdf_parser.py`, 적재 로직은 `vector_db.py`와 `parent_store.py`가 담당하며, 이 파일은 전체 파이프라인을 오케스트레이션한다.
 
 ---
 
-## 역할
-이 파일은 `data/raw/company/` 디렉터리를 기준으로 PDF 문서를 순회하며, 각 문서에 대해 파싱 작업을 수행하는 오케스트레이션 레이어이다.
+## 실행 모드
 
-구체적으로 다음 책임을 가진다.
+```bash
+# 기본 모드: 신규 PDF만 파싱 + 적재
+cd src && uv run python company_ingest.py
 
-- 하위 폴더를 포함한 전체 PDF 스캔
-- 각 PDF의 출력 디렉터리 경로 계산
-- 이미 처리된 파일 스킵 여부 판단
-- `pdf_parser.parse_single_pdf()` 호출
-- 실패 시 재시도 및 백오프 처리
-- 최종 실패 항목을 `failed_parse.log`에 기록
-- 전체 실행 결과를 요약 출력
-- 파싱 완료 후 `company_vectordb.upsert_all()` 자동 호출
-
-즉, 개별 PDF 파싱 로직은 `pdf_parser.py`가, 적재 로직은 `company_vectordb.py`가 담당하며, 이 파일은 **전체 파이프라인을 한 번에 실행하는 배치 오케스트레이터**이다.
+# 재청킹 모드: API 호출 없이 기존 .md 재청킹 + 전체 재적재
+cd src && uv run python company_ingest.py --rechunk-only
+```
 
 ---
 
-## 이 파일이 필요한 이유
-실제 회사 문서 기반 RAG 파이프라인에서는 PDF를 한 개씩 수동으로 파싱하는 방식이 비효율적이다.  
-문서 수가 늘어나면 다음과 같은 요구가 생긴다.
+## 설정 상수
 
-- 새로 추가된 PDF만 처리하고 싶다
-- 이미 처리된 파일은 다시 돌리지 않고 싶다
-- 일시적인 API 오류가 나도 자동으로 재시도하고 싶다
-- 실패한 파일은 나중에 다시 확인할 수 있어야 한다
-
-`company_ingest.py`는 이러한 요구를 만족하기 위해 만들어진 **배치 파싱 진입 스크립트**이다.
-
----
-
-## 주요 구성 요소
-
-### 상수 설정
-- `COMPANY_INPUT_DIR`  
-  원본 PDF가 저장된 입력 디렉터리
-
-- `COMPANY_OUTPUT_ROOT`  
-  파싱 결과가 저장되는 출력 루트 디렉터리
-
-- `FAILED_LOG_PATH`  
-  최종 실패 파일 기록용 로그 경로
-
-- `MAX_RETRIES`  
-  최대 재시도 횟수
-
-- `RETRY_BASE_DELAY`  
-  재시도 시 기본 대기 시간(지수 백오프 시작값)
+| 상수 | 값 |
+|------|-----|
+| `COMPANY_INPUT_DIR` | `data/raw/company/` |
+| `COMPANY_OUTPUT_ROOT` | `data/processed/parsing_result_company/` |
+| `FAILED_LOG_PATH` | `COMPANY_OUTPUT_ROOT/failed_parse.log` |
+| `MAX_RETRIES` | `3` |
+| `RETRY_BASE_DELAY` | `5`초 (지수 백오프 시작값) |
 
 ---
 
-### `get_output_dir(pdf_path: Path) -> Path`
-입력 PDF 경로를 기준으로, 출력 디렉터리 경로를 계산하는 헬퍼 함수이다.
-
-#### 역할
-- 입력 디렉터리 기준 상대 경로를 유지
-- 출력 루트 아래에 같은 폴더 구조를 복원
-- 파일명(stem)을 하위 폴더명으로 사용
-
-#### 목적
-입력 폴더 구조를 유지한 채 파싱 결과를 관리하기 위함이다.  
-이렇게 하면 원본 PDF와 결과 디렉터리의 대응 관계를 쉽게 추적할 수 있다.
-
----
-
-### `append_failed_log(pdf_path: Path, reason: str) -> None`
-파싱에 최종 실패한 파일 정보를 `failed_parse.log`에 누적 기록한다.
-
-#### 기록 내용
-- 실패 시각
-- 입력 디렉터리 기준 상대 경로
-- 실패 원인 문자열
-
-#### 목적
-재처리 대상 확인, 에러 유형 분석, 운영 중 장애 추적을 쉽게 하기 위함이다.
-
----
-
-### `parse_with_retry(pdf_path: Path) -> List`
-단일 PDF 파싱을 재시도 로직과 함께 실행하는 함수이다.
-
-#### 동작 방식
-1. `parse_single_pdf()` 호출
-2. 실패하면 예외를 저장
-3. 최대 재시도 횟수 전까지 지수 백오프 후 다시 시도
-4. 모든 시도 실패 시 마지막 예외를 다시 발생시킴
-
-#### 특징
-- 비동기 함수(`async`)
-- 일시적 API 오류나 네트워크 문제에 대응 가능
-- 재시도 실패 여부를 명확하게 로깅
-
-#### 백오프 방식
-`RETRY_BASE_DELAY * (2 ** (attempt - 1))`
-
-예를 들어 기본값 기준:
-- 1차 실패 후 5초 대기
-- 2차 실패 후 10초 대기
-- 3차 실패 시 최종 실패 처리
-
----
+## 주요 함수
 
 ### `parse_all() -> None`
-이 파일의 핵심 메인 파싱 루프이다.
+기본 파싱 루프.
 
-#### 역할
-- 전체 PDF 목록 수집
-- 각 PDF에 대해 파싱 또는 스킵 판단
-- 성공/실패 목록 관리
-- 최종 요약 출력
+```
+data/raw/company/**/*.pdf 스캔
+  ↓
+각 PDF → parse_report.json + *.md 존재 확인
+  ├── 이미 있음 → SKIP
+  └── 없음 → parse_with_retry() 호출
+                  ↓
+              파싱 성공 → 청킹 → _route_and_ingest()
+              파싱 실패 → failed_parse.log 기록
+  ↓
+전체 결과 요약 출력 (파싱/스킵/실패 수)
+```
 
-#### 처리 대상
-`COMPANY_INPUT_DIR` 하위의 모든 `.pdf` 파일
-
-#### 수행 단계
-1. 전체 PDF 스캔
-2. 처리 대상 여부 판단
-3. 신규 파일 파싱 실행
-4. 실패 시 로그 기록
-5. 전체 결과 요약 출력
+스킵 판단 기준: `parse_report.json` + `*.md` 존재 여부.
 
 ---
 
-### `main()`
-비동기 메인 함수인 `parse_all()`을 실행하는 진입점이다.
+### `rechunk_all() -> None`
+재청킹 모드. Gemini API 호출 없이 기존 파싱 결과를 재청킹해 전체 재적재.
+
+```
+COMPANY_OUTPUT_ROOT/**/parse_report.json + *.md 수집
+  ↓
+split_markdown_into_chunks() 재실행
+  ↓
+ChromaDB 컬렉션 reset (force_reset=True)
+  ↓
+전체 청크 일괄 upsert + parent_index.json 교체
+```
+
+임베딩 모델 변경, 청킹 로직 수정 후 전체 재적재 시 사용.
+
+---
+
+### `_route_and_ingest(chunks, force_reset) -> None`
+청크 타입별 라우팅 + 적재.
+
+| 청크 타입 | 처리 |
+|----------|------|
+| `section`, `child` | ChromaDB upsert |
+| `parent` | `parent_store.merge_parents()` |
+
+적재 후 `bm25_retriever.rebuild_index()` 호출해 인메모리 인덱스 갱신.
+
+---
+
+### `parse_with_retry(pdf_path) -> list`
+단일 PDF 파싱 + 재시도.
+
+- 실패 시 지수 백오프: 5s → 10s → 20s
+- 모든 시도 실패 시 예외 raise → `failed_parse.log` 기록
 
 ---
 
 ## 처리 흐름
 
-### 1. 입력 디렉터리 스캔
-`data/raw/company/` 하위의 모든 PDF를 재귀적으로 검색한다.
+```
+data/raw/company/
+    │
+    ├── 특허리스트_1/특허A/특허A.pdf
+    └── 특허리스트_2/특허B/특허B.pdf
 
-### 2. 처리 대상 목록 확인
-전체 PDF 개수를 출력하고, 어떤 파일이 발견되었는지 로그로 남긴다.
+      ↓ company_ingest.py
 
-### 3. 각 PDF에 대한 출력 경로 계산
-각 파일마다 대응되는 출력 디렉터리 경로를 계산한다.
+data/processed/parsing_result_company/
+    ├── 특허리스트_1/특허A/
+    │   ├── parse_report.json
+    │   └── 특허A.md
+    └── 특허리스트_2/특허B/
+        ├── parse_report.json
+        └── 특허B.md
 
-### 4. 기존 결과 존재 여부 확인
-각 PDF에 대해 `vector_chunks.json` 존재 여부를 기준으로 스킵 가능 여부를 판단하도록 설계되어 있다.
+      ↓ _route_and_ingest()
 
-현재 코드에서는 스킵 로직이 주석 처리되어 있으므로, 실행 시 모든 PDF를 다시 파싱하게 된다.
-
-### 5. 신규 파일 파싱 실행
-`parse_with_retry()`를 통해 개별 PDF를 파싱한다.
-
-### 6. 실패 처리
-모든 재시도가 실패하면:
-- 실패 목록에 추가
-- `failed_parse.log`에 기록
-
-### 7. 최종 결과 요약 출력
-실행이 끝나면 다음 정보를 콘솔에 출력한다.
-
-- 전체 PDF 수
-- 신규 파싱 수
-- 스킵 수
-- 실패 수
-- 실패 파일 목록
-
-### 8. ChromaDB 적재 자동 실행
-파싱 성공 파일이 있으면 `company_vectordb.upsert_all()`을 자동으로 호출하여 ChromaDB 적재까지 완료한다.
+ChromaDB (section + child 청크)
+parent_index.json (parent 청크)
+BM25 인덱스 (인메모리, 서버 시작 시 재빌드)
+```
 
 ---
 
-## 입력과 출력
+## 설계 포인트
 
-### 입력
-- `data/raw/company/` 하위의 PDF 파일들
+### 1. 스킵 로직 (증분 처리)
+`parse_report.json` + `*.md` 두 파일 모두 존재하면 스킵. API 호출 비용 없이 새로 추가된 PDF만 처리.
 
-### 출력
-- 각 PDF별 파싱 결과 디렉터리
-- `vector_chunks.json` 등 후속 처리용 결과 파일
-- 실패 로그(`failed_parse.log`)
-- 콘솔 실행 요약
+### 2. Per-file 적재
+파일 하나 파싱 완료 시 즉시 적재. 전체 파싱 후 일괄 적재가 아니라 중간 실패 시 이미 처리된 파일은 보존.
+
+### 3. failed_parse.log 누적
+실패 파일 정보(시각, 경로, 원인)를 append 방식으로 기록. 재처리 대상 확인과 에러 유형 분석에 사용.
+
+### 4. 재청킹 모드
+`--rechunk-only` 플래그로 Gemini API 호출 없이 청킹 로직만 변경해 전체 재적재 가능. 청킹 파라미터 튜닝 후 빠르게 반영할 때 사용.
 
 ---
 
 ## 의존성
 
-### 내부 의존성
+### 내부
 - `pdf_parser.parse_single_pdf`
-- `company_vectordb.upsert_all`
+- `chunker.split_markdown_into_chunks`
+- `vector_db.upsert_chunks_to_chroma`, `vector_db.reset_collection`
+- `parent_store.merge_parents`, `parent_store.save_index`
+- `bm25_retriever.rebuild_index`
 
-파싱 로직은 `pdf_parser.py`가, ChromaDB 적재 로직은 `company_vectordb.py`가 담당한다.
-
-### 외부 라이브러리
-- `asyncio`
-- `logging`
-- `python-dotenv`
-- `pathlib`
+### 외부
+- `asyncio`, `argparse`, `logging`, `python-dotenv`, `pathlib`
 
 ---
-
-## 디렉터리 구조 관점에서의 의미
-이 모듈은 다음 디렉터리 흐름을 연결한다.
-
-- 입력: `data/raw/company/`
-- 출력: `data/processed/parsing_result_company/`
-
-즉, 원본 회사 PDF 문서를 받아 **파싱 결과 저장소로 넘기는 첫 번째 배치 자동화 단계**에 해당한다.
-
----
-
-## 예외 및 주의사항
-
-### 1. 현재 스킵 로직이 비활성화되어 있음
-코드상 `vector_chunks.json` 존재 시 스킵하는 로직이 주석 처리되어 있다.
-
-즉, 현재 상태에서는 실행할 때마다 모든 PDF를 다시 파싱한다.  
-운영 환경에서 증분 처리만 원할 경우 이 로직을 다시 활성화해야 한다.
-
-### 2. 실패 로그는 누적된다
-`failed_parse.log`는 append 방식으로 기록되므로, 실행할수록 누적된다.  
-필요 시 실행 전 초기화하거나 날짜별 로그 분리를 고려할 수 있다.
-
-### 3. 최종 실패 기준은 재시도 이후
-중간에 한 번 실패했다고 바로 실패 처리되지 않고, 재시도 로직을 모두 소진한 후 최종 실패로 기록된다.
-
-### 4. 비동기 구조이지만 현재는 순차 처리
-`parse_all()`은 비동기 함수이지만, 현재 구현은 PDF를 병렬 처리하지 않고 순차적으로 실행한다.  
-즉, 안정성은 높지만 대량 문서 처리 시 시간이 길어질 수 있다.
-
----
-
-## 이 파일이 프로젝트에서 갖는 의미
-`company_ingest.py`는 회사 문서 기반 RAG 시스템에서 **원본 문서를 파싱 가능한 구조로 변환하는 배치 진입점**이다.
-
-전체 파이프라인 기준으로 보면 다음 흐름 전체를 하나의 명령어로 실행한다.
-
-1. 회사 PDF 수집
-2. `company_ingest.py` 실행 → 파싱 + ChromaDB 적재 자동 완료
-3. `rag_chain.py`를 통한 검색 및 질의응답
-
-즉, 이 파일은 **문서 수집 이후 챗봇 사용 가능 상태까지 전 과정을 one-command로 완료하는 인제스트 진입점**이다.
-
----
-
-## 사용 방법
-
-프로젝트 루트 기준:
-
-```bash
-cd src && uv run python company_ingest.py
-```
-
----
-최종 수정: 2026-03-19
-관련 파일: 'src/company_ingest.py'
+최종 수정: 2026-03-27
+관련 파일: `src/company_ingest.py`
 ---

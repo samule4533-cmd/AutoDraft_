@@ -1,256 +1,150 @@
 # query_processor.py
-2026-03-19
 
-Phase 2에서 신규 추가된 쿼리 전처리 모듈. `rag_chain.py`에서 분리된 질문 이해/재작성/라우팅 전담 레이어.
+사용자 질문을 RAG 실행 전에 전처리하는 레이어. 히스토리 정리 → 지시어 재작성 → 구어체 변환 → 유형 분류 → 청구항 번호 추출까지 담당.
 
 ## 개요
-`query_processor.py`는 사용자 질문을 RAG 실행 전에 전처리하는 레이어이다.
-원본 질문을 받아 검색에 최적화된 형태로 변환하고, 어떤 처리 경로를 거칠지 결정한 뒤 `QueryContext`를 반환한다.
 
-`rag_chain.py`는 이 결과만 받아 실행에만 집중한다.
-
-이 파일의 핵심 목적은 다음과 같다.
-
-- 오래된 대화 기록 정리
-- 지시어 포함 질문을 맥락 기반으로 재작성 (조건부)
-- 구어체/짧은 질문을 벡터 검색에 최적화된 형태로 변환 (조건부)
-- 질문 유형(meta/existence/content) 분류
-
-즉, 이 모듈은 **사용자 자연어 질문과 RAG 실행 사이의 전처리 계층**이다.
+`rag_chain.py`는 이 결과(`QueryContext`)만 받아 실행에만 집중한다.
 
 ---
 
-## 역할
-이 파일은 `rag_chain.ask()`가 호출되기 전에 질문을 정리하고 처리 방향을 결정한다.
+## 설정값: `PROCESSOR_CONFIG`
 
-구체적으로 다음 책임을 가진다.
-
-- chat_history를 최근 N턴으로 슬라이싱
-- 지시어 감지 시 LLM으로 질문 재작성 (Reformulation)
-- 구어체/짧은 질문을 키워드 중심 문장으로 변환 (Understanding)
-- 질문 유형을 패턴 기반으로 분류 (Routing)
-- 결과를 `QueryContext` Pydantic 모델로 반환
+| 키 | 기본값 | 의미 |
+|----|--------|------|
+| `gemini_model` | `"gemini-2.0-flash"` | reformulation 모델 |
+| `understanding_model` | `"gemini-2.0-flash"` | understanding 모델 |
+| `history_max_turns` | `5` | 보존할 최대 대화 턴 수 |
 
 ---
 
-## 이 파일이 필요한 이유
-`rag_chain.py`가 전처리와 실행을 모두 담당하면 파일이 비대해지고 각 단계의 테스트/디버깅이 어렵다.
+## `QueryContext`
 
-전처리를 분리하면 다음 이점이 생긴다.
+전처리 결과를 담는 Pydantic BaseModel.
 
-- reformulation이 잘못됐는지, 검색이 잘못됐는지 원인을 분리해서 볼 수 있다
-- 각 단계를 독립적으로 수정할 수 있다
-- `rag_chain.py`는 실행에만 집중해 코드가 단순해진다
-
----
-
-## 주요 구성 요소
-
-### `PROCESSOR_CONFIG`
-전처리 관련 설정을 한 곳에 모아둔 딕셔너리이다.
-
-#### 포함 항목
-- `gemini_model`: reformulation에 사용할 모델
-- `understanding_model`: understanding에 사용할 모델
-- `history_max_turns`: chat_history 보존 최대 턴 수 (기본 5턴)
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `original_query` | `str` | 사용자 원본 질문 (LLM 프롬프트에 사용) |
+| `search_query` | `str` | 실제 벡터/BM25 검색에 사용할 쿼리 |
+| `reformulated` | `str \| None` | 지시어 재작성 결과 (디버그) |
+| `understood` | `str \| None` | 구어체 변환 결과 (디버그) |
+| `query_type` | `str` | `"greeting"` \| `"meta"` \| `"existence"` \| `"content"` |
+| `claim_numbers` | `list[int]` | 추출된 청구항 번호 (`[1, 3]` 등) |
 
 ---
 
-### `QueryContext`
-전처리 결과를 담는 Pydantic BaseModel이다.
+## 패턴 상수
 
-#### 필드
-- `original_query` — 사용자 원본 질문 (프롬프트 생성에 사용)
-- `search_query` — 실제 벡터 검색에 사용할 쿼리
-- `reformulated` — reformulation 발생 시 재작성 결과, 없으면 None
-- `understood` — understanding 발생 시 변환 결과, 없으면 None
-- `query_type` — "meta" / "existence" / "content"
-
----
-
-### 패턴 상수
-
-#### `_REFERENTIAL_PATTERN`
-지시어 감지용 정규식이다.
-
-포함 패턴: `그럼`, `거기`, `그건`, `그것`, `해당`, `방금`, `그거`, `그 `
-
-이 패턴이 감지되고 chat_history가 있을 때만 Reformulation을 실행한다.
-
-#### `_COLLOQUIAL_PATTERN`
-구어체 어미 감지용 정규식이다.
-
-포함 패턴: `알려줘`, `뭐야`, `있어`, `있나`, `해줘` 등
-
-이 패턴이 감지되거나 질문이 15자 미만이면 Understanding을 실행한다.
-
-#### `_META_PATTERN`
-DB 전체 현황 질문 감지용 정규식이다.
-
-"파일 몇 개야?", "파일 갯수 알려줘", "어떤 문서들 있어?" 등을 meta로 분류한다.
-
-#### `_EXISTENCE_PATTERN`
-특정 주제 자료 존재 여부 질문 감지용 정규식이다.
-
-"에너지 관련 특허 있어?", "RAG 자료 있나요?" 등을 existence로 분류한다.
+| 상수 | 역할 |
+|------|------|
+| `_REFERENTIAL_PATTERN` | `그럼`, `거기`, `그건` 등 지시어 감지 |
+| `_COLLOQUIAL_PATTERN` | `알려줘`, `뭐야`, `있어` 등 구어체 어미 감지 |
+| `_GREETING_PATTERN` | 인사·감정·날씨·일상 잡담 감지 |
+| `_META_PATTERN` | "파일 몇 개야?", "어떤 문서들 있어?" 감지 |
+| `_EXISTENCE_PATTERN` | "에너지 관련 특허 있어?" 등 존재 확인 감지 |
+| `_TOPIC_LIST_PATTERN` | "에너지 관련 파일 뭐있어" 등 주제별 파일 목록 감지 |
+| `_CLAIM_NUM_PATTERN` | "제N항", "N항" → "청구항 N" 정규화 |
+| `_CLAIM_NUM_EXTRACT` | "청구항 N" → 정수 N 추출 |
 
 ---
 
 ## 주요 함수
 
 ### `trim_history(history, max_turns) -> list`
-chat_history를 최근 max_turns 턴으로 슬라이싱한다.
-
-#### 동작 방식
-- 1턴 = user + assistant 메시지 쌍 = 2개
-- `history[-(max_turns * 2):]`
-
-#### 이유
-사내 문서 QA 특성상 오래된 맥락의 가치가 낮고, 히스토리가 쌓이면 컨텍스트 창 초과 및 응답 지연이 발생한다.
+chat_history를 최근 `max_turns` 턴(= 메시지 2개)으로 슬라이싱한다.
 
 ---
 
 ### `should_reformulate(query, history) -> bool`
-지시어가 포함되어 있고 이전 대화가 있을 때만 True를 반환한다.
-
-#### 두 조건 동시 요구 이유
-- history가 없으면 재작성에 쓸 맥락이 없어 LLM 호출이 무의미하다
-- 지시어가 없으면 독립 질문이므로 원본 그대로 검색해도 품질 차이가 없다
+지시어 감지 **AND** chat_history 존재 시 True. 두 조건 모두 충족해야 reformulation 의미가 있다.
 
 ---
 
 ### `reformulate_query(query, history, req_id) -> str`
-이전 대화 맥락을 참고해 지시어가 포함된 질문을 독립적인 형태로 재작성한다.
-
-#### Fallback 처리
-실패 시 원본 query 반환. 이 단계의 실패가 전체 흐름을 막아선 안 된다.
+이전 대화 맥락 참고 → 지시어를 구체적 표현으로 재작성. 실패 시 원본 쿼리 반환.
 
 ---
 
 ### `should_understand(query) -> bool`
-구어체 어미가 감지되거나 15자 미만 짧은 질문일 때 True를 반환한다.
-
-#### 15자 기준 이유
-"에너지 사용량은?" (9자), "출원일 알려줘" (8자) 같은 짧은 질문은 벡터 검색 정밀도가 낮아 변환이 필요하다.
+구어체 어미 감지 **OR** 15자 미만 짧은 질문 시 True.
 
 ---
 
 ### `understand_query(query, req_id) -> str`
-구어체 질문을 벡터 검색에 최적화된 키워드 중심 문장으로 변환한다.
+구어체 질문 → 벡터 검색 최적화 키워드 문장으로 변환. LLM이 `[[CHITCHAT]]`을 반환하면 greeting으로 처리. 실패 시 원본 반환.
 
-#### Fallback 처리
-실패 시 원본 query 반환.
+#### `[[CHITCHAT]]` 판정 기준
+- 순수 사교적·개인적 표현(인사, 감정, 날씨, 개인 식사 계획 등)
+- `사내/회사/대표/직원/CEO/복지/규정/연락처/전화` 단어가 하나라도 있으면 `[[CHITCHAT]]` 금지
+
+---
+
+### `_normalize_claim_terms(text) -> str`
+"제N항", "N항" → "청구항 N" 정규화. understanding 전후 양쪽에 적용해 BM25 인덱스와 표기를 일치시킨다.
+
+---
+
+### `_extract_claim_numbers(text) -> list[int]`
+"청구항 1과 청구항 3" → `[1, 3]` 추출. `QueryContext.claim_numbers`에 저장.
 
 ---
 
 ### `classify_query(query) -> QueryType`
-질문 유형을 패턴 기반으로 분류한다. LLM 호출 없이 처리한다.
+패턴 기반 라우팅. LLM 호출 없음.
 
-#### 분류 결과
-- `meta`: DB 전체 현황 질문 ("파일 몇 개야?")
-- `existence`: 특정 주제 자료 존재 확인 ("에너지 관련 특허 있어?")
-- `content`: 문서 내용 기반 질의응답 (그 외 모든 질문)
-
-#### 패턴 기반 선택 이유
-라우팅은 단순 분류라 LLM이 필요없다. LLM 호출 시 매 질문마다 추가 지연/비용이 발생한다.
+분류 우선순위:
+1. `greeting` → `_GREETING_PATTERN` 매칭
+2. `meta` → `_TOPIC_LIST_PATTERN` 또는 `_META_PATTERN` 매칭
+3. `existence` → `_EXISTENCE_PATTERN` 매칭
+4. `content` → 위 패턴 미매칭
 
 ---
 
 ### `process_query(query, chat_history, req_id) -> QueryContext`
-이 파일의 메인 진입점이다.
-
-#### 처리 순서
-1. history trim
-2. reformulation (조건부)
-3. understanding (조건부)
-4. routing
-
-#### 반환 필드 의미
-- `original_query`: 프롬프트 생성 시 사용 (자연어 원본 유지)
-- `search_query`: ChromaDB 벡터 검색 시 사용 (최적화된 쿼리)
-- `reformulated`: 재작성 발생 여부 (디버깅)
-- `understood`: 검색 최적화 변환 발생 여부 (디버깅)
-- `query_type`: 라우팅 결정 기준
-
----
-
-## 처리 흐름
+메인 진입점.
 
 ```
-원본 질문
-    ↓
-history trim (항상)
-    ↓
-지시어 감지? + history 있음?
-  Yes → reformulation → base_query 갱신
-  No  → 원본 그대로
-    ↓
-구어체/짧은 질문?
-  Yes → understanding → search_query 갱신
-  No  → base_query 그대로
-    ↓
-패턴 매칭 → meta / existence / content 분류
-    ↓
+history trim
+  ↓
+지시어 감지 + history 있음? → reformulation → base_query 갱신
+  ↓
+classify_query(base_query) → query_type 결정
+  ↓
+구어체/짧은 질문? → understand_query
+  └── [[CHITCHAT]] 반환 → query_type = "greeting"
+  ↓
+_normalize_claim_terms → _extract_claim_numbers
+  ↓
 QueryContext 반환
 ```
 
 ---
 
-## 의존성
-
-### 내부 의존성
-- `src.llm_api.get_client`
-
-### 외부 라이브러리
-- `pydantic` (BaseModel)
-- `google.genai.types`
-- `logging`, `os`, `re`
-
----
-
 ## 설계 포인트
 
-### 1. 조건부 실행으로 비용 최소화
-모든 질문에 reformulation과 understanding을 실행하면 매 턴 Gemini 호출이 최대 2회 추가된다. 필요한 경우에만 실행해 비용과 지연을 줄인다.
+### 1. 조건부 LLM 호출
+모든 질문에 reformulation + understanding을 실행하면 매 턴 Gemini 최대 2회 추가 호출. 필요한 경우에만 실행해 비용과 지연 최소화.
 
-### 2. Fallback 필수
-reformulation과 understanding은 보조 수단이므로, 실패 시 원본 query로 자동 복구되어 전체 흐름이 중단되지 않는다.
+### 2. Greeting 판정 범위 제한
+`[[CHITCHAT]]`은 순수 사교적 표현에만 적용. 회사·직원·복지 키워드가 있으면 content로 처리해 문서 검색을 시도한다. (회사 정보를 LLM이 지어내는 환각 방지)
 
-### 3. 라우팅은 패턴 기반
-meta/existence 분류에 LLM이 필요 없으므로 정규식으로 처리한다. 속도와 비용 모두 절감된다.
+### 3. 청구항 번호 추출
+BM25 IDF 희석 문제를 우회하기 위해 `claim_numbers`를 별도 추출 → `rag_chain.retrieve()`에서 헤더 직접 매칭에 사용.
 
-### 4. original_query와 search_query 분리
-LLM 프롬프트에는 자연스러운 원본 질문을, 벡터 검색에는 최적화된 쿼리를 각각 사용한다.
-
----
-
-## 예외 및 주의사항
-
-### 1. routing은 원본 query 기준
-reformulation/understanding 이후가 아니라 원본 질문으로 routing한다. 변환 과정에서 질문 의도가 바뀌는 것을 방지하기 위함이다.
-
-### 2. 패턴 미매칭은 content로 fallback
-meta/existence 패턴에 해당하지 않는 질문은 모두 content로 분류된다.
+### 4. routing은 base_query 기준
+reformulation 이전 기준으로 routing해 변환 과정에서 질문 의도가 바뀌는 것을 방지.
 
 ---
 
-## 사용 방법
+## 의존성
 
-`rag_chain.ask()` 내부에서 자동으로 호출된다. 직접 호출 예시:
+### 내부
+- `llm_api.get_client`
 
-```python
-from src.query_processor import process_query
-
-ctx = process_query(
-    query="그럼 거기 출원일은?",
-    chat_history=[...],
-    req_id="test-001",
-)
-print(ctx.query_type)    # "content"
-print(ctx.search_query)  # 재작성된 쿼리
-```
+### 외부
+- `pydantic`, `google.genai`, `logging`, `os`, `re`
 
 ---
-최종 수정: 2026-03-19
-관련 파일: 'src/query_processor.py'
+최종 수정: 2026-03-27
+관련 파일: `src/query_processor.py`
 ---

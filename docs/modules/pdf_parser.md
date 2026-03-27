@@ -393,6 +393,6 @@ cd src && uv run python pdf_parser.py
 ```
 
 ---
-최종 수정: 2026-03-17
-관련 파일: 'src/pdf_parser.py'
+최종 수정: 2026-03-27
+관련 파일: `src/pdf_parser.py`
 ---
