@@ -45,6 +45,7 @@ class QueryContext(BaseModel):
     reformulated:   str | None   # reformulation 발생 시 재작성 결과, 없으면 None
     understood:     str | None   # understanding 발생 시 검색 최적화 결과, 없으면 None
     query_type:     QueryType    # "meta" | "existence" | "content"
+    claim_numbers:  list[int]    # search_query에서 감지된 청구항 번호 (없으면 빈 리스트)
 
 
 # =============================================================================
@@ -75,8 +76,9 @@ _UNDERSTANDING_PROMPT = """\
    - 특히 "청구항 N", "제N항" 같은 특허 청구항 번호는 반드시 "청구항 N" 형태(숫자 그대로)로 보존하라
 4. 동의어·유사어를 병기해 검색 범위를 넓혀라. 예: "창호" → "창호 창문", "냉방" → "냉방 에어컨 냉각"
 5. 한 문장으로 출력. 다른 설명 없이 변환된 문장만 출력
-6. 질문이 개인 감정/식사/날씨/일상 잡담이고 특허·기술 키워드가 단 하나도 없을 때만
-   "[[CHITCHAT]]" 을 그대로 출력하라 (조금이라도 업무/기술 관련이면 변환 진행)
+6. "[[CHITCHAT]]"은 오직 순수 사교적·개인적 표현(인사, 감정, 날씨, 개인 식사 계획 등)에만 출력하라.
+   "사내/회사/대표/직원/CEO/복지/규정/연락처/전화" 같은 단어가 하나라도 있으면
+   기술·특허 키워드가 없어도 반드시 변환을 진행하고 절대 "[[CHITCHAT]]"을 출력하지 말라.
 
 [질문]
 {query}
@@ -108,6 +110,23 @@ def _normalize_claim_terms(text: str) -> str:
     # "청구항 청구항 N" 중복 정리
     text = re.sub(r"청구항\s+청구항\s+(\d+)", r"청구항 \1", text)
     return text
+
+
+# 청구항 번호 추출: "청구항 N" → N (정규화 후 적용)
+# _normalize_claim_terms() 이후 호출하므로 "청구항 N" 형태만 커버하면 충분하다.
+_CLAIM_NUM_EXTRACT = re.compile(r"청구항\s+(\d+)")
+
+
+def _extract_claim_numbers(text: str) -> list[int]:
+    """
+    text에서 "청구항 N" 패턴의 N을 순서대로 추출한다 (중복 제거, 순서 보존).
+
+    예:
+        "청구항 1 설명해줘" → [1]
+        "청구항 1과 청구항 3 비교" → [1, 3]
+        "창문 관련 청구항 있어?" → []  (번호 없음)
+    """
+    return list(dict.fromkeys(int(m.group(1)) for m in _CLAIM_NUM_EXTRACT.finditer(text)))
 
 
 # reformulation: 지시어 포함 여부 감지
@@ -349,10 +368,16 @@ def process_query(
         # base_query 자체에서 왔을 경우 search_query에만 반영 (original_query는 유지)
     search_query = normalized
 
+    # 6. 청구항 번호 추출 — 정규화된 search_query 기준
+    # "청구항 1 설명해줘" → [1],  "청구항 1과 청구항 3 비교" → [1, 3]
+    # "창문 관련 청구항 있어?" → []  (번호 없음 → 기존 하이브리드 검색)
+    claim_numbers = _extract_claim_numbers(search_query)
+
     return QueryContext(
         original_query=query,
         search_query=search_query,
         reformulated=reformulated,
         understood=understood,
         query_type=query_type,
+        claim_numbers=claim_numbers,
     )

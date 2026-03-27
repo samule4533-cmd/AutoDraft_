@@ -56,8 +56,9 @@ SYSTEM_PROMPT = """\
 
 [규칙]
 1. 반드시 아래 [참고 문서]에 있는 내용에만 근거하여 답하라.
-2. 문서에 없는 내용은 절대 추측하거나 지어내지 말고, "해당 내용이 문서에 없습니다"라고 답하라.
-3. 본문에는 출처를 쓰지 말고, 답변 마지막에 아래 형식으로 출처를 모아서 표기하라.
+2. 문서에 없는 내용은 절대 추측하거나 지어내지 말고, "해당 내용이 문서에 없습니다"라고만 답하라.
+   이 경우 📎 출처 섹션을 쓰지 말라.
+3. 문서 내용을 실제로 인용한 경우에만, 본문에는 출처를 쓰지 말고, 답변 마지막에 아래 형식으로 출처를 모아서 표기하라.
    - 반드시 답변 내용이 실제로 들어있는 청크의 파일명과 헤더명을 사용하라.
    - 형식: 파일명.pdf > 헤더명 (순서 중요: 파일명이 먼저, 헤더명이 나중)
 
@@ -68,6 +69,7 @@ SYSTEM_PROMPT = """\
 4. 표, 수치, 날짜는 원문 그대로 인용하라.
 5. 한국어로 답하라.
 6. 핵심만 간결하게 3~5문장 이내로 답하라. 불필요한 배경 설명이나 서론은 생략한다.
+   단락과 단락 사이, 번호 목록 항목 사이에 빈 줄을 넣지 말라. 출처 블록 바로 앞에만 빈 줄 하나를 둔다.
 7. "발표용", "기술적 관점", "사업성 관점", "쉽게 설명", "간단히" 등 형식·관점 지시가 포함된 경우,
    문서 내용을 그 형식에 맞게 재구성하여 답하라. 이는 내용 검색이 아니라 형식 변환 요청이다.
 """
@@ -77,6 +79,7 @@ _CHITCHAT_SYSTEM_PROMPT = """\
 당신은 회사 내부 문서 어시스턴트입니다.
 인사나 잡담에는 자연스럽고 친근하게 짧게 답하라.
 한국어로 답하라.
+전화번호·복지·규정·인물 정보 등 회사 사실을 묻는 질문이 오면 절대 지어내지 말고 "해당 정보가 등록된 문서에 없습니다"라고만 답하라.
 """
 
 
@@ -353,6 +356,7 @@ def retrieve(
     query: str,
     req_id: str,
     filters: dict | None = None,
+    claim_numbers: list[int] | None = None,
 ) -> tuple[list[dict], int]:
     """
     하이브리드 검색: BM25 + 벡터 검색 → RRF → top_n 반환.
@@ -381,6 +385,17 @@ def retrieve(
     bm25_raw  = bm25_retriever.search(query, top_k=cfg["bm25_top_k"])
     bm25_hits = _apply_bm25_filters(bm25_raw, filters)
     logger.info("[%s] BM25 검색: %d개 (필터 후 %d개)", req_id, len(bm25_raw), len(bm25_hits))
+
+    # ── Step 1-b: 청구항 번호 헤더 주입 ─────────────────────────────────────
+    # "청구항 N" 쿼리는 Kiwi IDF 희석으로 BM25 순위가 낮아질 수 있다.
+    # header에서 직접 매칭한 청크를 BM25 결과 최상위에 주입해 우회한다.
+    if claim_numbers:
+        claim_hits = bm25_retriever.fetch_by_claim_numbers(claim_numbers)
+        if claim_hits:
+            existing_ids = {c["chunk_id"] for c in bm25_hits}
+            injected = [c for c in claim_hits if c["chunk_id"] not in existing_ids]
+            bm25_hits = injected + bm25_hits
+            logger.info("[%s] 청구항 헤더 주입: %d개 (청구항 번호=%s)", req_id, len(injected), claim_numbers)
 
     # ── Step 2: 벡터 검색 ──────────────────────────────────────────────────
     raw = query_collection(
@@ -718,7 +733,11 @@ def _handle_content(
     """일반 RAG 파이프라인. retrieve → quality_gate → build → generate → cite."""
     # 검색
     try:
-        chunks, union_count = retrieve(ctx.search_query, req_id, filters=filters)
+        chunks, union_count = retrieve(
+            ctx.search_query, req_id,
+            filters=filters,
+            claim_numbers=ctx.claim_numbers or None,
+        )
     except Exception as e:
         logger.error("[%s] 검색 실패: %s", req_id, e)
         return _make_fallback(ctx, "retrieval_error", _MSG_RETRIEVAL_ERROR)
@@ -744,11 +763,35 @@ def _handle_content(
             fallback_reason=    "no_docs",
         )
 
+    # 청구항 번호 검증: 요청된 청구항이 실제로 통과 청크에 있는지 확인
+    missing_note = ""
+    if ctx.claim_numbers:
+        found_headers = {c.get("header", "") for c in passed}
+        missing_claims = [
+            n for n in ctx.claim_numbers
+            if not any(f"청구항 {n}" in h for h in found_headers)
+        ]
+        if missing_claims:
+            nums = ", ".join(str(n) for n in missing_claims)
+            if len(missing_claims) == len(ctx.claim_numbers):
+                # 요청한 청구항이 모두 없음 → LLM 호출 없이 즉시 반환
+                return _make_fallback(
+                    ctx, "no_docs",
+                    f"청구항 {nums}을(를) 문서에서 찾을 수 없습니다.",
+                    retrieved_count=union_count,
+                    passed_threshold=len(passed),
+                    top_distance=passed[0].get("distance") if passed else None,
+                    top_rrf_score=top_rrf,
+                )
+            # 일부만 없음 → 컨텍스트에 주석 추가 후 진행
+            missing_note = f"[참고: 청구항 {nums}은(는) 문서에서 찾을 수 없습니다. 답변 시 이 사실을 명시하라.]\n\n"
+            logger.info("[%s] 청구항 일부 없음: %s", req_id, missing_claims)
+
     # child 청크는 parent intro + 인접 child로 확장 (section은 그대로)
     expanded = _expand_context(passed, req_id)
 
     # 컨텍스트 + 프롬프트 (원본 질문으로 자연스럽게 답변, chat_history 반영)
-    context = build_context_block(expanded, req_id)
+    context = missing_note + build_context_block(expanded, req_id)
     history = trim_history(chat_history) if chat_history else None
     prompt  = build_prompt(ctx.original_query, context, history)
 
@@ -765,9 +808,20 @@ def _handle_content(
             top_rrf_score=top_rrf,
         )
 
+    # LLM이 "문서에 없다"고 답한 경우 검색 청크를 출처로 노출하지 않는다.
+    # 또한 LLM이 answer 텍스트 안에 불필요하게 쓴 📎 출처 섹션도 제거한다.
+    _NO_DOCS_SIGNALS = ("찾을 수 없", "문서에 없", "없습니다", "등록되어 있지 않")
+    is_no_docs = any(s in answer for s in _NO_DOCS_SIGNALS)
+    if is_no_docs:
+        # "📎 출처" 이후 텍스트 제거
+        cutoff = answer.find("📎 출처")
+        if cutoff != -1:
+            answer = answer[:cutoff].rstrip()
+    citations_out = [] if is_no_docs else format_citations(passed)
+
     result = RagResult(
         answer=             answer,
-        citations=          format_citations(passed),
+        citations=          citations_out,
         query_type=         ctx.query_type,
         used_query=         ctx.search_query,
         reformulated_query= ctx.reformulated,

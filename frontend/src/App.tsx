@@ -325,7 +325,7 @@ export default function App() {
             <button className="summary-btn" onClick={openSummary}>
               사내 자료 AI 요약
             </button>
-            <span className="summary-tooltip">적재된 사내 자료의 핵심 내용을 요약합니다</span>
+            <span className="summary-tooltip">적재된 자료의 핵심 내용을 요약합니다.</span>
           </div>
         </header>
 
@@ -337,7 +337,7 @@ export default function App() {
               <p className="guide-title">💡 이런 질문을 해보세요</p>
               <div className="guide-pills">
                 <button className="guide-pill" onClick={() => setInput('우리 회사에 업로드된 파일이 몇 개 있어?')}>
-                  우리 회사에 업로드된 파일이 몇 개 있어?
+                  업로드된 파일이 몇 개 있어?
                 </button>
                 <button className="guide-pill" onClick={() => setInput('에너지 관련 특허가 있어?')}>
                   에너지 관련 특허가 있어?
